@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+
+# State and runtime artifacts
+state.json
+state.json.bak
+*.log
+*.bak
+.bot-response.md
+.bot-pr-body.md
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Build (if any future tooling adds it)
+build/
+dist/
+*.egg-info/

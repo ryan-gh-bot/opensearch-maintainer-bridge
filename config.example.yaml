@@ -1,0 +1,72 @@
+# github-bridge config
+#
+# Copy to ~/.config/opensearch-maintainer-bot/config.yaml and edit for your setup.
+#
+# Credentials are NOT here. They live in ~/.config/opensearch-sql-bot/credentials
+# (a .env-style file with GITHUB_BOT_TOKEN and GITHUB_BOT_USERNAME).
+
+# The repo the bridge polls for commands.
+# Format: "owner/repo". Initially this should be a test fork, NOT the real repo.
+watched_repo: "ryan-gh-bot/sql"
+
+# Map repo → tenant identifier used by the agent.
+# The tenant must exist under OpenSearchMaintainerAgent's context/tenants/<tenant>/.
+# Key is "owner/repo"; value is the tenant identifier passed to the agent.
+repo_tenant_map:
+  "ryan-gh-bot/sql": "sql"
+  "opensearch-project/sql": "sql"
+  # future: "opensearch-project/dashboards-query-workbench": "query-workbench"
+
+# Map tenant → local workdir path.
+# Each tenant needs a clone of its repo on disk that the agent will work in.
+tenant_workdirs:
+  sql: "/path/to/sql-checkout"
+
+# Allowlist of GitHub usernames permitted to invoke commands.
+# Anything not in this list is silently ignored (with a log entry). We do NOT
+# post a "not authorized" comment — that would be noisy and could be abused
+# for spam by outsiders who learn the bot exists.
+# From MAINTAINERS.md + RyanL1997 (you) for testing.
+allowlist:
+  - "RyanL1997"       # me, for testing
+  - "mengweieric"
+  - "joshuali925"
+  - "ps48"
+  - "swiddis"
+  - "dai-chen"
+  - "vamsimanohar"
+  - "penghuo"
+  - "anirudha"
+  - "ykmr1224"
+  - "LantaoJin"
+  - "noCharger"
+  - "qianheng-aws"
+  - "yuancu"
+  - "ahkcs"
+  - "songkant-aws"
+  - "acarbonetto"
+
+# Commands recognized on comment first-line. Anything else is ignored.
+# Key is the command string (with leading /); value is the SOP name the agent loads.
+commands:
+  "/rca": "rca"
+  "/reproduce": "reproduce"
+
+# Polling interval in seconds.
+poll_interval_seconds: 30
+
+# Per-command timeout for the kiro-cli subprocess (seconds).
+agent_timeout_seconds: 600
+
+# Whether to post an acknowledgment comment before dispatching to the agent.
+# "comment" = post "[Working] on /cmd..." comment up front, then the response.
+# "reaction" = react with 👀 to the triggering comment, then post the response.
+# "none" = no ack, just the response.
+acknowledgment_mode: "comment"
+
+# Hard cap on response comment length (chars). GitHub's limit is 65536.
+max_comment_length: 60000
+
+# Dry run: if true, log what would be posted but don't actually post.
+# Very useful for the first end-to-end test.
+dry_run: true
