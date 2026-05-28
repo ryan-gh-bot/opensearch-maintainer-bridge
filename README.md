@@ -13,13 +13,14 @@ On each polling cycle:
    - Drops it if the commenter isn't on the maintainer allowlist.
    - Drops it if the bot itself is the author (loop prevention).
    - Parses the rest as either a slash-command (`/rca`, `/reproduce`, `/fix`) or a natural-language `@triage` invocation.
-3. Prepares the tenant's local repo workdir (fetch, checkout, clean) and configures a `target` remote pointing at the issue's source repo.
-4. For commands that may produce a PR (`/fix` and `@triage`): ensures the bot's fork of the target exists, lazy-creating it via the GitHub API on first use.
-5. Fetches the full conversation thread on the issue/PR and embeds it in the agent's prompt as a `<<<CONVERSATION` block annotated with author/maintainer/bot/triggering flags.
-6. Invokes the agent (`kiro-cli chat --agent opensearch-maintainer-agent --no-interactive --trust-all-tools`), streaming stdout/stderr to the bridge log so a human tailing the log can watch the agent work in real time.
-7. After the agent exits:
+3. For each PR the bot previously authored (tracked in state): also fetches new top-level review wrappers (`/pulls/N/reviews`) and line-anchored review comments (`/pulls/N/comments`). `@<bot>` mentions in either are dispatched to the same handlers as conversation comments.
+4. Prepares the tenant's local repo workdir (fetch, checkout, clean) and configures a `target` remote pointing at the issue's source repo. For PR revisions, instead checks out the existing PR's branch (`origin/<branch>`) so additional commits land on the same branch.
+5. For commands that may produce a PR (`/fix` and `@triage`): ensures the bot's fork of the target exists, lazy-creating it via the GitHub API on first use.
+6. Fetches the full conversation thread on the issue/PR — including PR reviews and review-comments when applicable — and embeds it in the agent's prompt as a `<<<CONVERSATION` block annotated with `kind=`, `state=`, `file=`, `line=`, `author`, `maintainer`, `bot`, and `triggering` flags.
+7. Invokes the agent (`kiro-cli chat --agent opensearch-maintainer-agent --no-interactive --trust-all-tools`), streaming stdout/stderr to the bridge log so a human tailing the log can watch the agent work in real time.
+8. After the agent exits:
    - Reads `.bot-response.md` from the workdir as the comment to post (the agent writes here, not to stdout).
-   - For `/fix` paths only: if `.bot-pr-body.md` also exists and the agent committed, the bridge pushes the branch to the bot's fork and opens a cross-repo PR via the GitHub API, then posts a follow-up comment on the original issue with the PR link.
+   - For `/fix` paths: if `.bot-pr-body.md` also exists and the agent committed, the bridge pushes the branch and either (a) opens a new cross-repo PR via the GitHub API or (b) for revisions, GitHub auto-updates the existing PR and the bridge posts a "pushed updates" follow-up. PR revisions push with `--force-with-lease` so the agent can rebase if needed.
 
 The daemon is intentionally small, single-threaded, and reads-only-what-it-needs.
 
@@ -377,8 +378,6 @@ Per-repo state means high-traffic repos don't cause low-traffic repos to skip co
 
 ## Roadmap / future work
 
-- **PR revision flow.** When the bot is asked to update a PR it previously authored, push additional commits (or `--force-with-lease`) to the existing branch instead of refusing. Today `remote_branch_exists` causes `/fix` to refuse on re-invocation; the SOP recognizes the "address review feedback" pattern but the bridge's push path doesn't yet handle it.
-- **Inline PR review comments.** Fetch comments from `/repos/{repo}/pulls/{n}/comments` (the line-anchored review comment endpoint, distinct from the issue conversation endpoint we already use) and surface them to the agent for "address the inline comment on file X line Y" requests.
 - **Multi-author conversation citations.** The agent can reference prior comments by `[N]` (the index in the embedded `<<<CONVERSATION` block) but doesn't yet emit GitHub-permalink shortlinks like `https://github.com/.../#issuecomment-12345`. Useful for making `[Revised RCA]` comments self-linking.
 - **Dynamic allowlist.** Today the allowlist is a static config list. Pulling from `MAINTAINERS.md` in each watched repo at startup (with periodic refresh) would auto-track maintainer changes.
 - **Webhook delivery.** Polling at 30s is fine at this volume but a webhook receiver would reduce latency. Requires a publicly-reachable endpoint, which a dev-desktop deployment doesn't have.
