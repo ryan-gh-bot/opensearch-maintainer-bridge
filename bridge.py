@@ -465,19 +465,33 @@ def handle_comment(
     # Enforce our length cap.
     body = truncate_comment(body, cfg.max_comment_length)
 
-    # Post (or dry-run).
-    if cfg.dry_run:
-        logger.info("DRY RUN — would post to %s#%d:\n%s\n---END DRY RUN---",
-                    repo, comment.issue_number, body)
-        return
+    # Post via the routing helper so review-comment dispatches reply inline.
+    _post_response_to_comment(cfg, gh, state, repo, comment, body)
 
-    try:
-        posted = gh.post_comment(repo, comment.issue_number, body)
-    except GitHubError:
-        logger.exception("failed to post response comment")
-        return
-    state.record_posted(posted.id)
-    logger.info("posted response as comment %d (%s)", posted.id, posted.html_url)
+
+def _ack_body(comment: Comment, parsed: ParsedCommand) -> str:
+    """Compose the ack message. The wording differs by where the trigger came
+    from so it actually describes what's happening:
+
+      - Line-anchored review-comment dispatch ("revision via review-comment"):
+        "Working on review feedback from @user — replying when done."
+      - Top-level review-wrapper dispatch ("revision via review"):
+        "Working on review from @user — replying when done."
+      - Synthesized triage on a fresh issue/PR ("@bot do X"):
+        "Working on your request from @user — posting result when done."
+      - Slash command (/fix, /rca, /reproduce):
+        "Working on `/<cmd>` (invoked by @user) — posting result when done."
+    """
+    user = comment.user
+    if comment.review_comment_id is not None:
+        return (
+            f"Working on review feedback from @{user} — replying when done."
+        )
+    if parsed.command == "triage":
+        return f"Working on your request from @{user} — posting result when done."
+    return (
+        f"Working on `/{parsed.command}` (invoked by @{user}) — posting result when done."
+    )
 
 
 def _acknowledge(
@@ -488,17 +502,20 @@ def _acknowledge(
     comment: Comment,
     parsed: ParsedCommand,
 ) -> int | None:
-    """Post an acknowledgment per cfg.acknowledgment_mode. Returns posted id or None."""
+    """Post an acknowledgment per cfg.acknowledgment_mode. Returns posted id or None.
+
+    Acknowledgments route through _post_response_to_comment so that a
+    review-comment dispatch posts its ack inline in the review-comment thread,
+    not on the conversation tab.
+    """
     if cfg.dry_run:
         logger.info("DRY RUN — skipping acknowledgment")
         return None
     try:
         if cfg.acknowledgment_mode == "comment":
-            body = f"Working on `{parsed.command}` (invoked by @{comment.user}) — posting result when done."
-            posted = gh.post_comment(repo, comment.issue_number, body)
-            state.record_posted(posted.id)
-            logger.info("ack comment posted: %d", posted.id)
-            return posted.id
+            body = _ack_body(comment, parsed)
+            _post_response_to_comment(cfg, gh, state, repo, comment, body)
+            return None  # posted id already recorded by helper
         elif cfg.acknowledgment_mode == "reaction":
             gh.add_reaction(repo, comment.id, "eyes")
             logger.info("ack reaction added to comment %d", comment.id)
@@ -518,23 +535,15 @@ def _post_error(
     triggering_comment: Comment,
     message: str,
 ) -> None:
-    """Post an [Error] comment on the same issue as the triggering comment."""
+    """Post an [Error] comment in the right place relative to the triggering
+    comment (review-comment thread reply if applicable, else top-level)."""
     body = (
         f"[Error] {message}\n\n"
         f"---\n"
         f"_Automated response from @{cfg.github_bot_username} (maintainer-triggered agent). "
         f"[About this agent](https://github.com/ryan-gh-bot/opensearch-maintainer-agent)._"
     )
-    if cfg.dry_run:
-        logger.info("DRY RUN — would post error to %s#%d: %s",
-                    repo, triggering_comment.issue_number, message)
-        return
-    try:
-        posted = gh.post_comment(repo, triggering_comment.issue_number, body)
-        state.record_posted(posted.id)
-        logger.info("error comment posted: %d", posted.id)
-    except GitHubError:
-        logger.exception("failed to post error comment")
+    _post_response_to_comment(cfg, gh, state, repo, triggering_comment, body)
 
 
 # -------------------------------------------------------------------
@@ -739,8 +748,7 @@ def handle_fix_comment(
             _post_error(cfg, gh, state, repo, comment,
                         "Agent finished without writing a PR body or a status comment.")
             return
-        _post_issue_comment(cfg, gh, state, repo, comment.issue_number,
-                            truncate_comment(response_body, cfg.max_comment_length))
+        _post_response_to_comment(cfg, gh, state, repo, comment, truncate_comment(response_body, cfg.max_comment_length))
         return
 
     # Verify the agent committed before we attempt to push.
@@ -758,8 +766,7 @@ def handle_fix_comment(
                 "Agent reviewed the request but produced no commits and no "
                 "response body. This is likely a bug — bridge logs have details."
             )
-            _post_issue_comment(cfg, gh, state, repo, comment.issue_number,
-                                truncate_comment(msg, cfg.max_comment_length))
+            _post_response_to_comment(cfg, gh, state, repo, comment, truncate_comment(msg, cfg.max_comment_length))
             return
         _post_error(cfg, gh, state, repo, comment,
                     "Agent wrote a PR body but did not commit any changes. "
@@ -798,7 +805,7 @@ def handle_fix_comment(
             f"This update was generated by `@{cfg.github_bot_username}` in response "
             f"to feedback from @{comment.user}. Please review the new commits."
         )
-        _post_issue_comment(cfg, gh, state, repo, comment.issue_number, follow_up)
+        _post_response_to_comment(cfg, gh, state, repo, comment, follow_up)
         return
 
     # Open the PR (fresh-fix path only).
@@ -846,7 +853,7 @@ def handle_fix_comment(
         f"This was generated by `/fix` invoked by @{comment.user}. "
         f"The PR body includes Before/After verification output. Please review."
     )
-    _post_issue_comment(cfg, gh, state, repo, comment.issue_number, follow_up)
+    _post_response_to_comment(cfg, gh, state, repo, comment, follow_up)
 
 
 def build_fix_prompt(
@@ -972,6 +979,75 @@ def build_fix_prompt(
     )
 
 
+def _post_response_to_comment(
+    cfg: Config,
+    gh: GitHubClient,
+    state: State,
+    repo: str,
+    triggering_comment: Comment,
+    body: str,
+) -> None:
+    """Post a response that lands in the right place relative to the triggering
+    comment.
+
+    - If the triggering comment was a line-anchored PR review-comment
+      (`triggering_comment.review_comment_id is not None`), reply inside that
+      review-comment thread via /pulls/{n}/comments/{id}/replies. The bot's
+      response shows up threaded under the maintainer's question in the
+      Files-changed tab — which is what makes the interaction feel like a
+      regular contributor reply rather than an out-of-band notice on the
+      conversation tab.
+
+    - Otherwise (issue comment, PR conversation comment, or PR top-level
+      review wrapper), post a top-level comment via /issues/{n}/comments.
+
+    On API failure of the in-thread reply path, falls back to a top-level
+    comment so the response isn't lost.
+
+    Records the posted id in posted-comment-ids so the bridge doesn't re-poll
+    its own output on the next cycle.
+    """
+    if cfg.dry_run:
+        if triggering_comment.review_comment_id:
+            logger.info("DRY RUN — would reply in review-comment thread %d on %s#%d: %s",
+                        triggering_comment.review_comment_id, repo,
+                        triggering_comment.issue_number, body[:200])
+        else:
+            logger.info("DRY RUN — would post comment on %s#%d: %s",
+                        repo, triggering_comment.issue_number, body[:200])
+        return
+
+    rcid = triggering_comment.review_comment_id
+    if rcid is not None:
+        try:
+            reply = gh.create_review_comment_reply(
+                repo, triggering_comment.issue_number, rcid, body,
+            )
+            new_id = reply.get("id")
+            if new_id:
+                state.record_posted(int(new_id))
+            logger.info("posted reply in review-comment thread %d on %s#%d: %s",
+                        rcid, repo, triggering_comment.issue_number,
+                        reply.get("html_url") or "(no url)")
+            return
+        except GitHubError:
+            logger.exception(
+                "failed to reply in review-comment thread %d on %s#%d — "
+                "falling back to top-level comment",
+                rcid, repo, triggering_comment.issue_number,
+            )
+            # Fall through to top-level post.
+
+    try:
+        posted = gh.post_comment(repo, triggering_comment.issue_number, body)
+        state.record_posted(posted.id)
+        logger.info("posted comment on %s#%d: %s",
+                    repo, triggering_comment.issue_number, posted.html_url)
+    except GitHubError:
+        logger.exception("failed to post comment on %s#%d",
+                         repo, triggering_comment.issue_number)
+
+
 def _post_issue_comment(
     cfg: Config,
     gh: GitHubClient,
@@ -980,7 +1056,11 @@ def _post_issue_comment(
     issue_number: int,
     body: str,
 ) -> None:
-    """Post a comment on an issue and record it in posted-ids state. No-op if dry_run."""
+    """Post a top-level comment on an issue/PR. Use _post_response_to_comment
+    when you have a triggering Comment in hand — that helper preserves the
+    in-thread reply behavior for review-comment dispatches. This function is
+    only kept for paths that don't have a triggering Comment to reply to
+    (none today, but reserved for future)."""
     if cfg.dry_run:
         logger.info("DRY RUN — would post comment on %s#%d: %s",
                     repo, issue_number, body[:200])
@@ -1226,6 +1306,10 @@ def _poll_pr_reviews_once(
             updated_at=rc.get("created_at") or "",
             html_url=rc.get("html_url") or "",
             is_pull_request=True,
+            # Tag the synthesized Comment with the review-comment id so the
+            # bridge replies in the same thread (Files-changed tab) instead
+            # of posting a top-level conversation comment.
+            review_comment_id=rcid,
         )
         logger.info("dispatching review-comment on %s#%d: id=%d author=%s file=%s line=%s",
                     repo, pr_number, rcid, author, rc.get("path"), rc.get("line"))

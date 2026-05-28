@@ -39,6 +39,12 @@ class Comment:
     # Derived from html_url — whether the comment is on a pull request or an issue.
     # We don't rely on this today but exposing it keeps future commands simpler.
     is_pull_request: bool
+    # If this Comment was synthesized from a PR line-anchored review comment,
+    # the original review comment's id. Used by the bridge to post replies in
+    # the same review-comment thread (via the /pulls/{n}/comments/{id}/replies
+    # endpoint) instead of the conversation tab. None for normal comments and
+    # for top-level review wrappers (which have no per-line thread).
+    review_comment_id: Optional[int] = None
 
 
 class GitHubError(Exception):
@@ -93,6 +99,31 @@ class GitHubClient:
         url = f"{API_ROOT}/repos/{repo}/issues/{issue_number}/comments"
         resp = self._post(url, json={"body": body})
         return _comment_from_api(resp.json())
+
+    def create_review_comment_reply(
+        self,
+        repo: str,
+        pr_number: int,
+        review_comment_id: int,
+        body: str,
+    ) -> dict:
+        """Post a reply inside a PR review-comment thread (the line-anchored
+        thread shown in the Files-changed tab and on the conversation timeline
+        as a threaded reply rather than a top-level comment).
+
+        Uses POST /repos/{repo}/pulls/{pull_number}/comments/{comment_id}/replies.
+
+        Returns the new review-comment dict (same shape as list_pr_review_comments
+        entries). The caller should use the returned `id` to advance any cursors
+        if needed — though in practice the bridge skips bot-authored entries on
+        re-poll, so this isn't strictly necessary.
+        """
+        url = (
+            f"{API_ROOT}/repos/{repo}/pulls/{pr_number}/comments/"
+            f"{review_comment_id}/replies"
+        )
+        resp = self._post(url, json={"body": body})
+        return resp.json()
 
     def add_reaction(self, repo: str, comment_id: int, reaction: str = "eyes") -> None:
         """Add a reaction emoji to a comment. Valid reactions per GitHub docs:
