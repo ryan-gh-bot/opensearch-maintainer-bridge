@@ -126,10 +126,23 @@ class GitHubClient:
         return resp.json()
 
     def add_reaction(self, repo: str, comment_id: int, reaction: str = "eyes") -> None:
-        """Add a reaction emoji to a comment. Valid reactions per GitHub docs:
-        +1, -1, laugh, confused, heart, hooray, rocket, eyes.
+        """Add a reaction emoji to an issue/PR conversation comment. Valid
+        reactions per GitHub docs: +1, -1, laugh, confused, heart, hooray,
+        rocket, eyes.
         """
         url = f"{API_ROOT}/repos/{repo}/issues/comments/{comment_id}/reactions"
+        self._post(url, json={"content": reaction})
+
+    def add_pr_review_comment_reaction(
+        self, repo: str, review_comment_id: int, reaction: str = "eyes"
+    ) -> None:
+        """Add a reaction emoji to a PR line-anchored review comment. The
+        endpoint is distinct from add_reaction (which is for issue/PR
+        conversation comments). Valid reactions are the same set."""
+        url = (
+            f"{API_ROOT}/repos/{repo}/pulls/comments/"
+            f"{review_comment_id}/reactions"
+        )
         self._post(url, json={"content": reaction})
 
     def get_issue(self, repo: str, issue_number: int) -> dict:

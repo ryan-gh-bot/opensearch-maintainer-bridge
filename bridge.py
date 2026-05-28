@@ -504,13 +504,28 @@ def _acknowledge(
 ) -> int | None:
     """Post an acknowledgment per cfg.acknowledgment_mode. Returns posted id or None.
 
-    Acknowledgments route through _post_response_to_comment so that a
-    review-comment dispatch posts its ack inline in the review-comment thread,
-    not on the conversation tab.
+    Special case: when the trigger is a PR line-anchored review-comment, ALWAYS
+    use a 👀 reaction on the original comment regardless of cfg.acknowledgment_mode.
+    A "Working on review feedback..." threaded reply followed by the actual
+    answer is too noisy for an inline thread — a regular contributor would just
+    eyes-emoji and reply when ready. Acknowledgments route through
+    _post_response_to_comment for top-level dispatches so the ack lands on the
+    correct surface.
     """
     if cfg.dry_run:
         logger.info("DRY RUN — skipping acknowledgment")
         return None
+
+    # Review-comment thread: silent eyes-emoji, no chatter.
+    if comment.review_comment_id is not None:
+        try:
+            gh.add_pr_review_comment_reaction(repo, comment.review_comment_id, "eyes")
+            logger.info("ack reaction on review-comment %d", comment.review_comment_id)
+        except GitHubError:
+            logger.exception("failed to add reaction to review-comment %d",
+                             comment.review_comment_id)
+        return None
+
     try:
         if cfg.acknowledgment_mode == "comment":
             body = _ack_body(comment, parsed)
