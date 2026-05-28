@@ -134,6 +134,74 @@ class GitHubClient:
             params = {}  # next-link URL has params baked in
         return out
 
+    # ---- pull request reviews and review comments ----
+    #
+    # GitHub has THREE distinct comment-shaped endpoints on a PR:
+    #   1. /issues/{n}/comments — the PR's "conversation" tab (covered above).
+    #   2. /pulls/{n}/reviews — the review wrapper objects (Approve, Request
+    #      Changes, Comment) with optional body text.
+    #   3. /pulls/{n}/comments — line-anchored review comments inside reviews.
+    # We need (2) and (3) for the bot to see PR review feedback.
+
+    def list_pr_reviews(self, repo: str, pr_number: int, per_page: int = 100) -> list:
+        """Return PR review wrappers (Approve/RequestChanges/Comment), oldest-first.
+
+        Each entry includes: id, user, body (may be empty for line-only reviews),
+        state ('APPROVED', 'CHANGES_REQUESTED', 'COMMENTED', 'DISMISSED'),
+        submitted_at (ISO-8601), html_url.
+        """
+        url = f"{API_ROOT}/repos/{repo}/pulls/{pr_number}/reviews"
+        params = {"per_page": str(per_page)}
+        out: list = []
+        while url:
+            resp = self._get(url, params=params)
+            for raw in resp.json():
+                out.append({
+                    "id": int(raw.get("id") or 0),
+                    "user": (raw.get("user") or {}).get("login", ""),
+                    "body": raw.get("body") or "",
+                    "state": raw.get("state") or "",
+                    "submitted_at": raw.get("submitted_at") or "",
+                    "html_url": raw.get("html_url") or "",
+                })
+            url = _next_link(resp.headers.get("Link", ""))
+            params = {}
+        return out
+
+    def list_pr_review_comments(self, repo: str, pr_number: int, per_page: int = 100) -> list:
+        """Return line-anchored review comments on a PR, oldest-first.
+
+        Each entry includes: id, user, body, path (file), line (or original_line
+        if the diff has shifted), diff_hunk, created_at, html_url, in_reply_to_id.
+        """
+        url = f"{API_ROOT}/repos/{repo}/pulls/{pr_number}/comments"
+        params = {"per_page": str(per_page)}
+        out: list = []
+        while url:
+            resp = self._get(url, params=params)
+            for raw in resp.json():
+                out.append({
+                    "id": int(raw.get("id") or 0),
+                    "user": (raw.get("user") or {}).get("login", ""),
+                    "body": raw.get("body") or "",
+                    "path": raw.get("path") or "",
+                    "line": raw.get("line") or raw.get("original_line"),
+                    "diff_hunk": raw.get("diff_hunk") or "",
+                    "created_at": raw.get("created_at") or "",
+                    "html_url": raw.get("html_url") or "",
+                    "in_reply_to_id": raw.get("in_reply_to_id"),
+                })
+            url = _next_link(resp.headers.get("Link", ""))
+            params = {}
+        return out
+
+    def get_pull_request(self, repo: str, pr_number: int) -> dict:
+        """Return the PR JSON. Notable fields: head.ref, head.sha, base.ref,
+        head.repo.full_name (the source repo, e.g., bot's fork)."""
+        url = f"{API_ROOT}/repos/{repo}/pulls/{pr_number}"
+        resp = self._get(url)
+        return resp.json()
+
     # ---- forks ----
 
     def get_repo(self, owner: str, name: str) -> Optional[dict]:
