@@ -70,6 +70,54 @@ def prepare(workdir: str, default_branch: str = "main", upstream_remote: str = "
     return cp.stdout.strip()
 
 
+def prepare_for_revision(workdir: str, branch_name: str) -> str:
+    """Prepare the workdir to add commits to an existing branch on `origin`
+    (the bot's fork). Used when the bot is asked to revise a PR it previously
+    authored — additional commits land on the same branch and the existing PR
+    auto-updates.
+
+    Steps:
+      - git fetch origin --prune  (refresh the bot's fork)
+      - git fetch target --prune  (so the agent can rebase / diff against
+                                   the current target base if it wants)
+      - git checkout -f origin/<branch>  (detached HEAD on the branch tip)
+      - git clean -fdx            (remove .bot-response.md / .bot-pr-body.md
+                                   from any prior crashed run)
+
+    Detached HEAD is intentional. The agent makes commits on top, and the
+    bridge pushes them via `git push origin HEAD:refs/heads/<branch>`,
+    which works the same whether the agent did a plain commit (fast-forward)
+    or a `git rebase target/<base>` (in which case the bridge uses
+    --force-with-lease to update the remote branch).
+
+    Returns the short sha of the resolved branch tip. Raises WorkdirError if
+    the branch can't be fetched (e.g., it's been deleted on the bot's fork)
+    or the workdir isn't a git checkout.
+    """
+    wd = Path(workdir)
+    if not (wd / ".git").exists():
+        raise WorkdirError(f"not a git checkout: {wd}")
+
+    _run(wd, ["git", "fetch", "origin", "--prune"])
+    # target may not be configured yet on first revision after a bridge restart;
+    # check=False so we don't fail. The agent can re-fetch it later if needed.
+    _run(wd, ["git", "fetch", "target", "--prune"], check=False)
+
+    cp = _run(wd, ["git", "rev-parse", "--verify", f"origin/{branch_name}"], check=False)
+    if cp.returncode != 0:
+        raise WorkdirError(
+            f"branch `{branch_name}` not found on origin — has it been deleted? "
+            f"Cannot revise; either restore the branch or invoke /fix on the "
+            f"original issue to create a new branch."
+        )
+
+    _run(wd, ["git", "checkout", "-f", f"origin/{branch_name}"])
+    _run(wd, ["git", "clean", "-fdx"])
+
+    cp = _run(wd, ["git", "rev-parse", "--short", "HEAD"])
+    return cp.stdout.strip()
+
+
 def ensure_target_remote(workdir: str, target_repo: str, remote_name: str = "target") -> None:
     """Idempotently configure a `<remote_name>` remote pointing at `target_repo`.
 

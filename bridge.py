@@ -35,6 +35,7 @@ from workdir_manager import (
     has_unpushed_commits,
     latest_commit_subject,
     prepare as prepare_workdir,
+    prepare_for_revision,
     push_branch,
     remote_branch_exists,
 )
@@ -77,71 +78,184 @@ MAX_CONVERSATION_COMMENTS = 50
 MAX_BODY_CHARS = 2000
 
 
+def _entry_from_comment(c: Comment) -> dict:
+    """Convert an issue/PR conversation Comment into a unified entry."""
+    return {
+        "kind": "conversation",
+        "id": c.id,
+        "user": c.user,
+        "body": c.body or "",
+        "at": c.created_at,
+        "html_url": c.html_url,
+        # Optional metadata fields that other kinds may set:
+        "state": None,
+        "path": None,
+        "line": None,
+    }
+
+
+def _entry_from_pr_review(r: dict) -> dict:
+    """Convert a PR review wrapper (Approve/RequestChanges/Comment) into a
+    unified entry. The review wrapper's body is what we expose; the state
+    (e.g. CHANGES_REQUESTED) is a metadata flag the agent can use."""
+    return {
+        "kind": "review",
+        "id": int(r.get("id") or 0),
+        "user": r.get("user") or "",
+        "body": r.get("body") or "",
+        "at": r.get("submitted_at") or "",
+        "html_url": r.get("html_url") or "",
+        "state": r.get("state") or "",
+        "path": None,
+        "line": None,
+    }
+
+
+def _entry_from_pr_review_comment(rc: dict) -> dict:
+    """Convert a line-anchored PR review comment into a unified entry. The
+    file path and line number become metadata flags so the agent can locate
+    the comment in the diff."""
+    return {
+        "kind": "review-comment",
+        "id": int(rc.get("id") or 0),
+        "user": rc.get("user") or "",
+        "body": rc.get("body") or "",
+        "at": rc.get("created_at") or "",
+        "html_url": rc.get("html_url") or "",
+        "state": None,
+        "path": rc.get("path"),
+        "line": rc.get("line"),
+    }
+
+
 def format_conversation(
-    comments,
+    entries,
     *,
     bot_username: str,
     allowlist_lower,
-    triggering_comment_id: int = 0,
+    triggering_id: int = 0,
 ) -> str:
-    """Render a list of Comment objects into the prompt's CONVERSATION block.
+    """Render a list of unified conversation entries into the prompt's
+    CONVERSATION block, sorted chronologically by `at` timestamp.
 
-    The block looks like:
+    Each entry is a dict with at minimum: kind, id, user, body, at. Kinds:
+      - "conversation"   — issue/PR conversation tab comment
+      - "review"         — PR review wrapper (Approve / Request Changes / Comment)
+      - "review-comment" — PR line-anchored review comment
+
+    Output (illustrative):
 
         <<<CONVERSATION
-        [1] author=alice maintainer=true bot=false at=2026-05-28T19:50:11Z
-            <body>
-        [2] author=ryan-gh-bot maintainer=false bot=true at=2026-05-28T19:54:21Z
+        [1] kind=conversation author=alice maintainer=true bot=false at=2026-05-28T19:50:11Z
+            @ryan-gh-bot, can you root cause this?
+        [2] kind=conversation author=ryan-gh-bot maintainer=false bot=true at=2026-05-28T19:54:21Z
             ## [RCA] ...
-        ...
+        [3] kind=review author=alice maintainer=true bot=false at=2026-05-28T22:30:00Z state=CHANGES_REQUESTED
+            The fix breaks 2.x compatibility — please address.
+        [4] kind=review-comment author=alice maintainer=true bot=false at=2026-05-28T22:34:07Z file=core/.../Foo.java line=555 triggering=true
+            @ryan-gh-bot why we are removing this?
         CONVERSATION>>>
 
-    Lines are 4-space indented under each header so the agent can clearly
-    distinguish comment metadata from comment bodies.
-
-    Author identity is structured: `maintainer` (allowlisted) and `bot` (us).
-    The agent uses this to chain on its own prior outputs and to weight
-    maintainer feedback over random user comments.
-
-    The TRIGGERING comment (the one that fired this invocation) is marked with
-    `triggering=true` so the agent can find "the latest request" without
-    timestamp arithmetic.
+    Lines are 4-space indented under each header. The TRIGGERING entry
+    is flagged so the agent can find "the latest request" without timestamp
+    arithmetic.
     """
-    if not comments:
-        return "<<<CONVERSATION\n(empty — this is the first comment-bearing event on this issue/PR)\nCONVERSATION>>>"
+    if not entries:
+        return ("<<<CONVERSATION\n"
+                "(empty — this is the first comment-bearing event on this issue/PR)\n"
+                "CONVERSATION>>>")
 
-    truncated_count = max(0, len(comments) - MAX_CONVERSATION_COMMENTS)
-    visible = comments[-MAX_CONVERSATION_COMMENTS:]
+    # Sort by timestamp (ISO-8601 strings sort correctly lexicographically).
+    # Tie-break by id to ensure deterministic ordering.
+    entries = sorted(entries, key=lambda e: (e.get("at") or "", e.get("id") or 0))
+
+    truncated_count = max(0, len(entries) - MAX_CONVERSATION_COMMENTS)
+    visible = entries[-MAX_CONVERSATION_COMMENTS:]
     bot_lower = bot_username.lower()
 
     out = ["<<<CONVERSATION"]
     if truncated_count:
         out.append(
-            f"(note: {truncated_count} earlier comment(s) omitted from this prompt; "
+            f"(note: {truncated_count} earlier entry/entries omitted from this prompt; "
             f"showing most recent {len(visible)})"
         )
 
-    for i, c in enumerate(visible, start=1):
-        is_bot = c.user.lower() == bot_lower
-        is_maint = c.user.lower() in allowlist_lower
-        triggering = c.id == triggering_comment_id
-        body = (c.body or "").rstrip()
+    for i, e in enumerate(visible, start=1):
+        user = e.get("user") or ""
+        is_bot = user.lower() == bot_lower
+        is_maint = user.lower() in allowlist_lower
+        triggering = e.get("id") == triggering_id
+        body = (e.get("body") or "").rstrip()
         if len(body) > MAX_BODY_CHARS:
-            body = body[:MAX_BODY_CHARS] + f"\n  [...truncated; {len(c.body) - MAX_BODY_CHARS} chars omitted]"
-        # Indent body under the header for readability.
+            body = body[:MAX_BODY_CHARS] + f"\n  [...truncated; {len(e.get('body') or '') - MAX_BODY_CHARS} chars omitted]"
         indented_body = "\n".join("    " + line for line in body.splitlines()) or "    (empty)"
-        flags = (
-            f"author={c.user} "
-            f"maintainer={'true' if is_maint else 'false'} "
-            f"bot={'true' if is_bot else 'false'} "
-            f"at={c.created_at}"
-        )
+
+        flag_parts = [
+            f"kind={e.get('kind') or 'conversation'}",
+            f"author={user}",
+            f"maintainer={'true' if is_maint else 'false'}",
+            f"bot={'true' if is_bot else 'false'}",
+            f"at={e.get('at') or ''}",
+        ]
+        if e.get("state"):
+            flag_parts.append(f"state={e['state']}")
+        if e.get("path"):
+            flag_parts.append(f"file={e['path']}")
+        if e.get("line"):
+            flag_parts.append(f"line={e['line']}")
         if triggering:
-            flags += " triggering=true"
-        out.append(f"[{i}] {flags}")
+            flag_parts.append("triggering=true")
+        out.append(f"[{i}] " + " ".join(flag_parts))
         out.append(indented_body)
     out.append("CONVERSATION>>>")
     return "\n".join(out)
+
+
+def fetch_full_thread(
+    gh: GitHubClient,
+    repo: str,
+    issue_number: int,
+    *,
+    is_pull_request: bool,
+) -> list:
+    """Fetch every comment-shaped artifact on an issue or PR and return them
+    as a flat list of unified entries (unsorted; format_conversation sorts).
+
+    For an issue: just the conversation comments.
+    For a PR: conversation comments + review wrappers + line-anchored
+    review comments.
+
+    Network failures on the secondary endpoints (reviews, review-comments)
+    are logged but don't fail the call — the agent gets a partial conversation
+    rather than an error.
+    """
+    entries: list = []
+
+    try:
+        for c in gh.list_comments_on_issue(repo, issue_number):
+            entries.append(_entry_from_comment(c))
+    except GitHubError as e:
+        logger.warning("failed to fetch conversation for #%d: HTTP %d",
+                       issue_number, e.status_code)
+
+    if is_pull_request:
+        try:
+            for r in gh.list_pr_reviews(repo, issue_number):
+                # Skip reviews with empty body — they're Approve/RequestChanges
+                # without a top-level message and add no signal to the agent.
+                if r.get("body"):
+                    entries.append(_entry_from_pr_review(r))
+        except GitHubError as e:
+            logger.warning("failed to fetch reviews for PR #%d: HTTP %d",
+                           issue_number, e.status_code)
+        try:
+            for rc in gh.list_pr_review_comments(repo, issue_number):
+                entries.append(_entry_from_pr_review_comment(rc))
+        except GitHubError as e:
+            logger.warning("failed to fetch review-comments for PR #%d: HTTP %d",
+                           issue_number, e.status_code)
+
+    return entries
 
 
 def build_agent_prompt(
@@ -289,18 +403,17 @@ def handle_comment(
     issue_body = issue.get("body") or ""
     is_pull_request = bool(issue.get("pull_request"))
 
-    # Fetch the conversation thread (issue/PR comments).
-    try:
-        comments_thread = gh.list_comments_on_issue(repo, comment.issue_number)
-    except GitHubError as e:
-        logger.warning("failed to fetch conversation for #%d: HTTP %d — proceeding without",
-                       comment.issue_number, e.status_code)
-        comments_thread = []
+    # Fetch the full conversation thread (issue/PR comments + PR reviews and
+    # review-comments if it's a PR). Network errors on individual endpoints
+    # log a warning but don't fail the call.
+    thread_entries = fetch_full_thread(
+        gh, repo, comment.issue_number, is_pull_request=is_pull_request
+    )
     conversation = format_conversation(
-        comments_thread,
+        thread_entries,
         bot_username=cfg.github_bot_username,
         allowlist_lower=cfg.allowlist_lower,
-        triggering_comment_id=comment.id,
+        triggering_id=comment.id,
     )
 
     # Build the prompt and invoke the agent.
@@ -508,24 +621,43 @@ def handle_fix_comment(
     target_meta = gh.get_repo(target_owner, target_repo_name)
     base_branch = (target_meta or {}).get("default_branch") or "main"
 
-    # Step 5: fetch & check out clean base.
-    try:
-        # Reuse existing prepare() to do clean, then fetch target/base on top.
-        prepare_workdir(workdir)  # fetches `upstream` and cleans — leftover from /rca conventions
-        sha = fetch_and_checkout(workdir, "target", base_branch)
-    except WorkdirError as e:
-        _post_error(cfg, gh, state, repo, comment,
-                    f"Failed to prepare workdir for /fix:\n\n```\n{e}\n```")
-        return
-    logger.info("/fix: workdir at target/%s @ %s", base_branch, sha)
+    # Step 5: figure out whether this is a fresh /fix or a revision of an
+    # existing bot-authored PR, then prepare the workdir accordingly.
+    rs = state.get_repo(repo)
+    is_revision = (
+        comment.is_pull_request
+        and comment.issue_number in rs.bot_authored_prs
+    )
+    if is_revision:
+        branch_name = rs.bot_authored_prs[comment.issue_number].branch
+        try:
+            sha = prepare_for_revision(workdir, branch_name)
+        except WorkdirError as e:
+            _post_error(cfg, gh, state, repo, comment,
+                        f"Failed to prepare workdir for PR revision:\n\n```\n{e}\n```")
+            return
+        logger.info(
+            "/fix [revision]: workdir at origin/%s @ %s (PR #%d)",
+            branch_name, sha, comment.issue_number,
+        )
+    else:
+        try:
+            prepare_workdir(workdir)  # fetches upstream, cleans
+            sha = fetch_and_checkout(workdir, "target", base_branch)
+        except WorkdirError as e:
+            _post_error(cfg, gh, state, repo, comment,
+                        f"Failed to prepare workdir for /fix:\n\n```\n{e}\n```")
+            return
+        logger.info("/fix: workdir at target/%s @ %s", base_branch, sha)
 
-    # Step 6: branch naming + collision check.
-    branch_name = f"bot-fix-{target_owner}-{target_repo_name}-{comment.issue_number}"
-    if remote_branch_exists(workdir, "origin", branch_name):
-        _post_error(cfg, gh, state, repo, comment,
-                    f"Branch `{branch_name}` already exists on `{bot_login}/{target_repo_name}`. "
-                    f"Close or delete the existing PR/branch before re-invoking /fix.")
-        return
+        # Step 6: branch naming + collision check (fresh-fix path only).
+        # For revisions we expect the branch to exist; that's the whole point.
+        branch_name = f"bot-fix-{target_owner}-{target_repo_name}-{comment.issue_number}"
+        if remote_branch_exists(workdir, "origin", branch_name):
+            _post_error(cfg, gh, state, repo, comment,
+                        f"Branch `{branch_name}` already exists on `{bot_login}/{target_repo_name}`. "
+                        f"Close or delete the existing PR/branch before re-invoking /fix.")
+            return
 
     # Step 7: ack.
     _acknowledge(cfg, gh, state, repo, comment, parsed)
@@ -541,18 +673,16 @@ def handle_fix_comment(
     issue_body  = issue.get("body") or ""
     is_pull_request = bool(issue.get("pull_request"))
 
-    # Fetch the conversation thread.
-    try:
-        comments_thread = gh.list_comments_on_issue(repo, comment.issue_number)
-    except GitHubError as e:
-        logger.warning("failed to fetch conversation for #%d: HTTP %d — proceeding without",
-                       comment.issue_number, e.status_code)
-        comments_thread = []
+    # Fetch the full conversation thread (issue/PR comments + PR reviews and
+    # review-comments if applicable).
+    thread_entries = fetch_full_thread(
+        gh, repo, comment.issue_number, is_pull_request=is_pull_request
+    )
     conversation = format_conversation(
-        comments_thread,
+        thread_entries,
         bot_username=cfg.github_bot_username,
         allowlist_lower=cfg.allowlist_lower,
-        triggering_comment_id=comment.id,
+        triggering_id=comment.id,
     )
 
     is_triage = sop_name == "triage"
@@ -614,22 +744,64 @@ def handle_fix_comment(
         return
 
     # Verify the agent committed before we attempt to push.
-    if not has_unpushed_commits(workdir, f"target/{base_branch}"):
+    # Base of comparison differs by mode:
+    #   - fresh fix: HEAD must be ahead of target/<base_branch>
+    #   - revision:  HEAD must be ahead of origin/<branch_name> (the existing
+    #                branch tip we checked out at the start)
+    base_ref = f"target/{base_branch}" if not is_revision else f"origin/{branch_name}"
+    if not has_unpushed_commits(workdir, base_ref):
+        if is_revision:
+            # Agent decided no code change was needed. Post the response (if any)
+            # as a comment on the PR and stop. This handles "explain X without
+            # changing code" / "I disagree, here's why" cases.
+            msg = response_body or (
+                "Agent reviewed the request but produced no commits and no "
+                "response body. This is likely a bug — bridge logs have details."
+            )
+            _post_issue_comment(cfg, gh, state, repo, comment.issue_number,
+                                truncate_comment(msg, cfg.max_comment_length))
+            return
         _post_error(cfg, gh, state, repo, comment,
                     "Agent wrote a PR body but did not commit any changes. "
                     "No PR posted.")
         return
 
-    # Push the branch.
+    # Push the branch. For revisions, use force-with-lease so a rebase from
+    # the agent (e.g. to incorporate new commits on target/main) can update
+    # the remote branch safely.
     try:
-        push_branch(workdir, "origin", branch_name, force=False)
+        push_branch(workdir, "origin", branch_name, force=is_revision)
     except WorkdirError as e:
         _post_error(cfg, gh, state, repo, comment,
                     f"Failed to push `{branch_name}` to `{bot_login}/{target_repo_name}`:\n\n```\n{e}\n```")
         return
-    logger.info("/fix pushed branch %s to %s/%s", branch_name, bot_login, target_repo_name)
+    logger.info(
+        "/fix [%s] pushed branch %s to %s/%s",
+        "revision" if is_revision else "fresh", branch_name, bot_login, target_repo_name,
+    )
 
-    # Open the PR.
+    # For revisions, the PR already exists — no need to create a new one.
+    # GitHub auto-updates the open PR when we push to its head branch.
+    if is_revision:
+        # Look up the existing PR's URL for the follow-up comment.
+        pr_url = "(existing PR — refresh to see new commits)"
+        try:
+            pr_obj = gh.get_pull_request(repo, comment.issue_number)
+            pr_url = pr_obj.get("html_url") or pr_url
+        except GitHubError:
+            pass
+        logger.info("/fix [revision] updated PR #%d: %s", comment.issue_number, pr_url)
+
+        commit_subject = latest_commit_subject(workdir)
+        follow_up = (
+            f"Pushed updates to {pr_url} (latest commit: `{commit_subject}`).\n\n"
+            f"This update was generated by `@{cfg.github_bot_username}` in response "
+            f"to feedback from @{comment.user}. Please review the new commits."
+        )
+        _post_issue_comment(cfg, gh, state, repo, comment.issue_number, follow_up)
+        return
+
+    # Open the PR (fresh-fix path only).
     pr_title = latest_commit_subject(workdir)
     pr_body  = pr_body_path.read_text(encoding="utf-8")
     head_ref = f"{bot_login}:{branch_name}"
@@ -658,6 +830,15 @@ def handle_fix_comment(
     pr_url = pr.get("html_url", "(unknown)")
     pr_number = pr.get("number")
     logger.info("/fix opened PR #%s: %s", pr_number, pr_url)
+
+    # Register this PR as bot-authored so future polling will fetch its
+    # reviews and review-comments. Without this the bot would never see
+    # maintainer review feedback on its own PRs.
+    if pr_number:
+        state.record_authored_pr(repo, int(pr_number), branch_name)
+        save_state(state)
+        logger.info("recorded %s#%s as bot-authored (branch=%s)",
+                    repo, pr_number, branch_name)
 
     # Step 10: follow-up comment on the issue.
     follow_up = (
@@ -892,6 +1073,175 @@ def _poll_repo_once(cfg: Config, gh: GitHubClient, state: State, repo: str) -> N
 
     logger.info("poll %s: processed=%d skipped=%d latest_id=%s",
                 repo, processed, skipped, rs.last_seen_comment_id)
+
+    # ---- Second loop: poll PR reviews and review-comments on bot-authored PRs ----
+    #
+    # /repos/{repo}/issues/comments (the polling stream above) covers the PR
+    # conversation tab but NOT review wrappers or line-anchored review comments.
+    # For each PR the bot has authored, fetch both endpoints and dispatch any
+    # entries that mention @<bot> in their body.
+    #
+    # We poll all bot-authored PRs (not just open ones) — closing a PR doesn't
+    # stop maintainers from posting follow-up reviews.
+    for pr_number in list(rs.bot_authored_prs.keys()):
+        try:
+            _poll_pr_reviews_once(cfg, gh, state, repo, pr_number)
+        except GitHubError as e:
+            logger.warning("error polling PR %s#%d reviews: HTTP %d — %s",
+                           repo, pr_number, e.status_code, e)
+        except Exception:  # noqa: BLE001
+            logger.exception("unhandled error polling PR %s#%d reviews", repo, pr_number)
+
+
+def _poll_pr_reviews_once(
+    cfg: Config,
+    gh: GitHubClient,
+    state: State,
+    repo: str,
+    pr_number: int,
+) -> None:
+    """Fetch new reviews + review-comments on a single bot-authored PR and
+    dispatch any with @<bot> mentions through handle_fix_comment.
+
+    The "newness" of an entry is determined by per-PR cursors:
+      - ap.last_seen_review_id        — for top-level reviews
+      - ap.last_seen_review_comment_id — for line-anchored review comments
+
+    GitHub's review and review-comment endpoints don't have a `since` filter,
+    so we fetch all entries and filter client-side by id. Volume is small
+    (one PR's review history; rarely more than a few dozen).
+    """
+    rs = state.get_repo(repo)
+    ap = rs.bot_authored_prs.get(pr_number)
+    if ap is None:
+        return  # raced with deletion
+
+    bot_lower = cfg.github_bot_username.lower()
+
+    # ---- Reviews (Approve / RequestChanges / Comment wrappers) ----
+    try:
+        reviews = gh.list_pr_reviews(repo, pr_number)
+    except GitHubError as e:
+        if e.status_code == 404:
+            logger.warning("PR %s#%d not found (deleted?); removing from authored set",
+                           repo, pr_number)
+            rs.bot_authored_prs.pop(pr_number, None)
+            save_state(state)
+            return
+        raise
+
+    cursor_review = ap.last_seen_review_id or 0
+    new_reviews_max_id = cursor_review
+
+    for r in reviews:
+        rid = int(r.get("id") or 0)
+        if rid <= cursor_review:
+            continue
+        if rid > new_reviews_max_id:
+            new_reviews_max_id = rid
+        # Reviews submitted by the bot itself: skip.
+        if (r.get("user") or "").lower() == bot_lower:
+            continue
+        body = r.get("body") or ""
+        if not body.strip():
+            # No body — probably an Approve or a line-only review. Nothing to dispatch.
+            continue
+        # Try to parse @<bot> mention.
+        parsed = parse_command(body, bot_username=cfg.github_bot_username)
+        if not parsed:
+            continue
+        if parsed.command not in cfg.commands:
+            logger.info("skip review %d on %s#%d: unrecognized command %s",
+                        rid, repo, pr_number, parsed.command)
+            continue
+        author = r.get("user") or ""
+        if not cfg.is_allowed(author):
+            logger.warning("skip review %d on %s#%d: user %s not on allowlist",
+                           rid, repo, pr_number, author)
+            continue
+
+        # Synthesize a Comment for the dispatcher. Treat the PR as the issue.
+        synth = Comment(
+            id=rid,
+            issue_number=pr_number,
+            user=author,
+            body=body,
+            created_at=r.get("submitted_at") or "",
+            updated_at=r.get("submitted_at") or "",
+            html_url=r.get("html_url") or "",
+            is_pull_request=True,
+        )
+        logger.info("dispatching PR review on %s#%d: review_id=%d author=%s cmd=%s",
+                    repo, pr_number, rid, author, parsed.command)
+        try:
+            handle_fix_comment(cfg, gh, state, repo, synth, parsed)
+        except Exception:  # noqa: BLE001
+            logger.exception("unhandled error processing review %d on %s#%d",
+                             rid, repo, pr_number)
+        finally:
+            # Persist cursor after each dispatch so a crash doesn't replay.
+            ap.last_seen_review_id = max(ap.last_seen_review_id or 0, rid)
+            save_state(state)
+
+    if new_reviews_max_id > (ap.last_seen_review_id or 0):
+        ap.last_seen_review_id = new_reviews_max_id
+
+    # ---- Line-anchored review comments ----
+    try:
+        rcomments = gh.list_pr_review_comments(repo, pr_number)
+    except GitHubError as e:
+        logger.warning("error fetching review-comments on %s#%d: HTTP %d",
+                       repo, pr_number, e.status_code)
+        rcomments = []
+
+    cursor_rcomment = ap.last_seen_review_comment_id or 0
+    new_rcomments_max_id = cursor_rcomment
+
+    for rc in rcomments:
+        rcid = int(rc.get("id") or 0)
+        if rcid <= cursor_rcomment:
+            continue
+        if rcid > new_rcomments_max_id:
+            new_rcomments_max_id = rcid
+        if (rc.get("user") or "").lower() == bot_lower:
+            continue
+        body = rc.get("body") or ""
+        parsed = parse_command(body, bot_username=cfg.github_bot_username)
+        if not parsed:
+            continue
+        if parsed.command not in cfg.commands:
+            continue
+        author = rc.get("user") or ""
+        if not cfg.is_allowed(author):
+            logger.warning("skip review-comment %d on %s#%d: user %s not on allowlist",
+                           rcid, repo, pr_number, author)
+            continue
+
+        synth = Comment(
+            id=rcid,
+            issue_number=pr_number,
+            user=author,
+            body=body,
+            created_at=rc.get("created_at") or "",
+            updated_at=rc.get("created_at") or "",
+            html_url=rc.get("html_url") or "",
+            is_pull_request=True,
+        )
+        logger.info("dispatching review-comment on %s#%d: id=%d author=%s file=%s line=%s",
+                    repo, pr_number, rcid, author, rc.get("path"), rc.get("line"))
+        try:
+            handle_fix_comment(cfg, gh, state, repo, synth, parsed)
+        except Exception:  # noqa: BLE001
+            logger.exception("unhandled error processing review-comment %d on %s#%d",
+                             rcid, repo, pr_number)
+        finally:
+            ap.last_seen_review_comment_id = max(ap.last_seen_review_comment_id or 0, rcid)
+            save_state(state)
+
+    if new_rcomments_max_id > (ap.last_seen_review_comment_id or 0):
+        ap.last_seen_review_comment_id = new_rcomments_max_id
+
+    save_state(state)
 
 
 def _now_iso() -> str:

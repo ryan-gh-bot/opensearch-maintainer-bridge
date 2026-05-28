@@ -5,6 +5,12 @@ so that after a restart the bridge doesn't replay comments it already
 handled. Tracks a single shared `posted_comment_ids` set across all repos,
 which is fine because GitHub comment ids are globally unique.
 
+Also tracks PRs the bot authored (one entry per PR, per repo) so the
+polling loop knows which PRs to check for review activity. Adding new
+review/review-comment polling to every PR in a watched repo would be
+prohibitively expensive on large repos; restricting it to bot-authored
+PRs is bounded and matches the actual use case.
+
 State file lives at ~/.local/state/opensearch-maintainer-bot/state.json.
 
 JSON schema (v2):
@@ -12,18 +18,26 @@ JSON schema (v2):
     "version": 2,
     "per_repo": {
       "<owner>/<repo>": {
-        "last_seen_comment_id": <int | null>,
-        "last_seen_at":        "<ISO-8601 | null>"
+        "last_seen_comment_id":   <int | null>,
+        "last_seen_at":           "<ISO-8601 | null>",
+        "bot_authored_prs":       {
+          "<pr_number>": {
+            "branch":                       "<branch-name>",
+            "last_seen_review_id":          <int | null>,
+            "last_seen_review_comment_id":  <int | null>
+          },
+          ...
+        }
       },
       ...
     },
     "posted_comment_ids": [<int>, ...]
   }
 
-A v1 state file (flat, single-repo) is auto-migrated on load. The
-migrated entries are associated with whichever repo the caller names
-when calling `get_repo_state(repo)` with no prior entry — if there's
-a pre-migration scalar, it's moved to that repo's slot on first access.
+The `bot_authored_prs` field was added after initial v2 release; older v2
+state files without it load fine (the field defaults to {}).
+
+A v1 state file (flat, single-repo) is auto-migrated on load.
 """
 
 from __future__ import annotations
@@ -39,21 +53,63 @@ STATE_FILE = STATE_DIR / "state.json"
 
 
 @dataclass
+class AuthoredPR:
+    """A pull request the bot authored. The branch lives on the bot's fork
+    (e.g., ryan-gh-bot/sql:bot-fix-...). The two `last_seen_*` cursors track
+    where polling left off, so we don't redispatch the same review repeatedly.
+    """
+    branch: str
+    last_seen_review_id: Optional[int] = None
+    last_seen_review_comment_id: Optional[int] = None
+
+    def as_dict(self) -> dict:
+        return {
+            "branch": self.branch,
+            "last_seen_review_id": self.last_seen_review_id,
+            "last_seen_review_comment_id": self.last_seen_review_comment_id,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AuthoredPR":
+        return cls(
+            branch=d.get("branch") or "",
+            last_seen_review_id=d.get("last_seen_review_id"),
+            last_seen_review_comment_id=d.get("last_seen_review_comment_id"),
+        )
+
+
+@dataclass
 class RepoState:
     last_seen_comment_id: Optional[int] = None
     last_seen_at: Optional[str] = None
+    # Map of pr_number -> AuthoredPR. Only PRs created by the bot via /fix
+    # land here; the bot doesn't react to reviews on other PRs.
+    bot_authored_prs: Dict[int, AuthoredPR] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return {
             "last_seen_comment_id": self.last_seen_comment_id,
             "last_seen_at": self.last_seen_at,
+            "bot_authored_prs": {
+                str(pr_num): ap.as_dict()
+                for pr_num, ap in self.bot_authored_prs.items()
+            },
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "RepoState":
+        prs: Dict[int, AuthoredPR] = {}
+        for pr_str, pr_d in (d.get("bot_authored_prs") or {}).items():
+            try:
+                pr_num = int(pr_str)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(pr_d, dict):
+                prs[pr_num] = AuthoredPR.from_dict(pr_d)
         return cls(
             last_seen_comment_id=d.get("last_seen_comment_id"),
             last_seen_at=d.get("last_seen_at"),
+            bot_authored_prs=prs,
         )
 
 
@@ -87,6 +143,16 @@ class State:
             self.posted_comment_ids.append(comment_id)
             if len(self.posted_comment_ids) > 1000:
                 self.posted_comment_ids = self.posted_comment_ids[-1000:]
+
+    def record_authored_pr(self, repo: str, pr_number: int, branch: str) -> None:
+        """Mark a PR as bot-authored so the polling loop will fetch its
+        reviews and review-comments going forward."""
+        rs = self.get_repo(repo)
+        if pr_number not in rs.bot_authored_prs:
+            rs.bot_authored_prs[pr_number] = AuthoredPR(branch=branch)
+        else:
+            # Update branch in case it ever changes (shouldn't, but defensive).
+            rs.bot_authored_prs[pr_number].branch = branch
 
 
 def load_state(path: Path = STATE_FILE) -> State:
