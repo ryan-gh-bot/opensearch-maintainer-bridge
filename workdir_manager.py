@@ -171,6 +171,26 @@ def has_unpushed_commits(workdir: str, base_ref: str) -> bool:
         return False
 
 
+def is_ancestor(workdir: str, ancestor_ref: str, descendant_ref: str = "HEAD") -> bool:
+    """Return True if `ancestor_ref` is an ancestor of `descendant_ref` —
+    i.e., descendant_ref is reachable from ancestor_ref via parent links.
+
+    Used to decide whether a push can be a fast-forward (plain push) or
+    requires history rewrite (force-with-lease). For a revision flow:
+      - Agent made additive commits on top of the existing branch tip:
+        existing_tip is an ancestor of HEAD → fast-forward, plain push works.
+      - Agent rebased or reset onto a different base: existing_tip is NOT an
+        ancestor of HEAD → force-with-lease required.
+    """
+    wd = Path(workdir)
+    cp = _run(
+        wd,
+        ["git", "merge-base", "--is-ancestor", ancestor_ref, descendant_ref],
+        check=False,
+    )
+    return cp.returncode == 0
+
+
 def push_branch(workdir: str, remote: str, branch_name: str, force: bool = False) -> None:
     """Push HEAD to `<remote>/<branch_name>`. If `force=False` (default) and
     the remote branch already exists, the push will be rejected — the bridge

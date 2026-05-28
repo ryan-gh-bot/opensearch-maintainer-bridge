@@ -33,6 +33,7 @@ from workdir_manager import (
     ensure_target_remote,
     fetch_and_checkout,
     has_unpushed_commits,
+    is_ancestor,
     latest_commit_subject,
     prepare as prepare_workdir,
     prepare_for_revision,
@@ -788,18 +789,32 @@ def handle_fix_comment(
                     "No PR posted.")
         return
 
-    # Push the branch. For revisions, use force-with-lease so a rebase from
-    # the agent (e.g. to incorporate new commits on target/main) can update
-    # the remote branch safely.
+    # Push the branch. Pick the right push mode:
+    #   - Fresh fix:  no remote branch yet, plain push.
+    #   - Revision, agent made additive commits (fast-forward):
+    #     plain push — keeps the PR timeline clean (no "force-pushed" noise).
+    #   - Revision, agent rebased or reset (rewrote history):
+    #     force-with-lease — required to update the remote branch safely.
+    #
+    # `sha` for revisions is the existing branch tip captured at workdir prep.
+    # If that sha is still an ancestor of HEAD, the agent only added commits
+    # on top → fast-forward push works.
+    if is_revision and not is_ancestor(workdir, sha, "HEAD"):
+        push_force = True
+        push_mode = "force-with-lease (history rewritten)"
+    else:
+        push_force = False
+        push_mode = "fast-forward" if is_revision else "fresh"
     try:
-        push_branch(workdir, "origin", branch_name, force=is_revision)
+        push_branch(workdir, "origin", branch_name, force=push_force)
     except WorkdirError as e:
         _post_error(cfg, gh, state, repo, comment,
                     f"Failed to push `{branch_name}` to `{bot_login}/{target_repo_name}`:\n\n```\n{e}\n```")
         return
     logger.info(
-        "/fix [%s] pushed branch %s to %s/%s",
-        "revision" if is_revision else "fresh", branch_name, bot_login, target_repo_name,
+        "/fix [%s] pushed branch %s to %s/%s (%s)",
+        "revision" if is_revision else "fresh",
+        branch_name, bot_login, target_repo_name, push_mode,
     )
 
     # For revisions, the PR already exists — no need to create a new one.
