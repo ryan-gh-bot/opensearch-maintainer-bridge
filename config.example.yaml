@@ -51,12 +51,15 @@ allowlist:
 commands:
   "/rca": "rca"
   "/reproduce": "reproduce"
+  "/fix": "fix"
+  "@triage": "triage"
 
 # Polling interval in seconds.
 poll_interval_seconds: 30
 
 # Per-command timeout for the kiro-cli subprocess (seconds).
 agent_timeout_seconds: 600
+fix_agent_timeout_seconds: 2400  # /fix runs build+tests; needs more headroom
 
 # Whether to post an acknowledgment comment before dispatching to the agent.
 # "comment" = post "[Working] on /cmd..." comment up front, then the response.

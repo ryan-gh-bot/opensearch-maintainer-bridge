@@ -60,3 +60,12 @@ Ctrl+C. The state file is persisted after every iteration, so restarts don't rep
 - The bridge will ignore its own comments (the `bot_username` from credentials).
 - The bridge does NOT execute arbitrary shell supplied by a comment — it only invokes `kiro-cli chat` with a fixed set of parameters.
 - The kiro-cli agent itself runs with filesystem access to the tenant's repo workdir only, per the agent spec's `allowedTools`.
+
+## Roadmap / future work
+
+These features are designed-around but not yet implemented:
+
+- **PR revision flow** — when the bot is asked to update a PR it previously authored, push additional commits (or force-push with `--force-with-lease`) to the existing branch instead of refusing because the branch already exists. Today, `remote_branch_exists` causes `/fix` to refuse on a re-invocation; the SOP recognizes the "address review feedback" pattern but the bridge's push path doesn't yet handle it.
+- **Inline PR review comments** — fetch comments from `/repos/{repo}/pulls/{n}/comments` (different endpoint from the issue conversation) and include them in the prompt for PR-venue invocations. Useful for "address the inline comment on file X line Y" requests.
+- **Slash-command parser for the agent's own follow-up references** — e.g., "build on RCA from comment #N" using GitHub's `#<id>` shortlink syntax. Today the agent reads the conversation block free-form.
+- **Caching** — every invocation re-fetches the conversation. Fine at one bot's volume; revisit if we ever poll many repos.

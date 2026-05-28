@@ -107,6 +107,111 @@ class GitHubClient:
         resp = self._get(url)
         return resp.json()
 
+    def list_comments_on_issue(
+        self,
+        repo: str,
+        issue_number: int,
+        per_page: int = 100,
+    ) -> list:
+        """Return all comments on a single issue/PR conversation, oldest-first.
+
+        Uses /repos/{repo}/issues/{n}/comments — note this endpoint covers
+        BOTH issue conversations and PR conversation comments (PRs are issues
+        in GitHub's REST model). Inline review comments on PR diffs are a
+        separate endpoint that we don't use here.
+
+        Returns Comment objects with full body, author, timestamps. Caller is
+        responsible for any truncation when embedding in a prompt.
+        """
+        url = f"{API_ROOT}/repos/{repo}/issues/{issue_number}/comments"
+        params = {"per_page": str(per_page)}
+        out: list = []
+        while url:
+            resp = self._get(url, params=params)
+            for raw in resp.json():
+                out.append(_comment_from_api(raw))
+            url = _next_link(resp.headers.get("Link", ""))
+            params = {}  # next-link URL has params baked in
+        return out
+
+    # ---- forks ----
+
+    def get_repo(self, owner: str, name: str) -> Optional[dict]:
+        """Return the repo JSON, or None if it doesn't exist (404)."""
+        url = f"{API_ROOT}/repos/{owner}/{name}"
+        try:
+            return self._get(url).json()
+        except GitHubError as e:
+            if e.status_code == 404:
+                return None
+            raise
+
+    def fork_exists_for_target(self, target_repo: str, bot_login: str) -> bool:
+        """Check whether the bot has a usable fork for `target_repo`.
+
+        We just check whether `<bot_login>/<repo-name>` exists. If it does, we
+        assume it can serve as the source for PRs to `target_repo` — this is
+        true as long as they share git history, which is the case when the
+        bot's fork and the target are both descended from the same upstream
+        (which is how forks work on GitHub).
+
+        Note: we intentionally do NOT verify `parent.full_name == target_repo`,
+        because the bot's fork has only one `parent` (its original source),
+        but it can serve PRs to any repo it shares history with. For example,
+        `ryan-gh-bot/sql` (forked from `opensearch-project/sql`) can serve
+        PRs to BOTH `opensearch-project/sql` and `RyanL1997/sql` because
+        all three share commits.
+        """
+        _, repo_name = target_repo.split("/", 1)
+        return self.get_repo(bot_login, repo_name) is not None
+
+    def create_fork(self, target_repo: str) -> dict:
+        """POST /repos/{target_repo}/forks. Returns the partial fork data.
+
+        GitHub's fork creation is async — it returns 202 Accepted with the new
+        repo's metadata, but the actual fork content may take a few seconds to
+        become readable. The caller is responsible for polling
+        `fork_exists_for_target` until True before relying on it.
+        """
+        url = f"{API_ROOT}/repos/{target_repo}/forks"
+        resp = self._post(url, json={})
+        return resp.json()
+
+    # ---- pull requests ----
+
+    def create_pull_request(
+        self,
+        target_repo: str,
+        *,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+        draft: bool = False,
+        maintainer_can_modify: bool = True,
+    ) -> dict:
+        """POST /repos/{target_repo}/pulls.
+
+        Args:
+            target_repo: the repo to open the PR against, e.g. "RyanL1997/sql".
+            head: the branch to merge from, in `owner:branch` form for cross-
+                repo PRs (e.g., "ryan-gh-bot:bot-fix-...").
+            base: the branch to merge into, e.g. "main".
+
+        Returns the PR JSON. Notable fields: `html_url`, `number`.
+        """
+        url = f"{API_ROOT}/repos/{target_repo}/pulls"
+        payload = {
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base,
+            "draft": draft,
+            "maintainer_can_modify": maintainer_can_modify,
+        }
+        resp = self._post(url, json=payload)
+        return resp.json()
+
     # ---- internals ----
 
     def _get(self, url: str, params: Optional[dict] = None) -> requests.Response:

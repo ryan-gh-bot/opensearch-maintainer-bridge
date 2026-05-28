@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -89,6 +90,34 @@ def _stream_reader(
             pass
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Kill `proc` and every descendant by sending SIGTERM/SIGKILL to its
+    process group. Requires that proc was launched with start_new_session=True
+    so it has its own pgid.
+
+    Two-phase: SIGTERM, brief grace period, then SIGKILL on anything still
+    alive. We don't bother polling — gradle/java sometimes ignores SIGTERM
+    if it's mid-test, and we want to release the workdir promptly.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        # Process already dead.
+        return
+    for sig_name, sig in (("SIGTERM", signal.SIGTERM), ("SIGKILL", signal.SIGKILL)):
+        try:
+            os.killpg(pgid, sig)
+            logger.info("sent %s to process group %d", sig_name, pgid)
+        except ProcessLookupError:
+            return  # nothing left
+        except OSError as e:
+            logger.warning("killpg(%d, %s) failed: %s", pgid, sig_name, e)
+            return
+        # Give the group up to 5s to drain after SIGTERM before escalating.
+        if sig is signal.SIGTERM:
+            time.sleep(5)
+
+
 def run_agent(
     prompt: str,
     workdir: str,
@@ -143,6 +172,11 @@ def run_agent(
             bufsize=1,
             cwd=str(wd),
             env=env,
+            # Put the subprocess (and any descendants like gradle/java) in
+            # its own process group so we can kill the whole tree on timeout.
+            # Without this, proc.kill() only kills kiro-cli; gradle keeps
+            # running in the background and holds the workdir.
+            start_new_session=True,
         )
     except FileNotFoundError as e:
         raise AgentRunError(f"kiro-cli not found on PATH: {e}") from e
@@ -178,8 +212,8 @@ def run_agent(
             break
         except subprocess.TimeoutExpired:
             if time.monotonic() >= deadline:
-                logger.error("agent exceeded %ds timeout, terminating", timeout_s)
-                proc.kill()
+                logger.error("agent exceeded %ds timeout, killing process group", timeout_s)
+                _kill_process_tree(proc)
                 timed_out = True
                 try:
                     exit_code = proc.wait(timeout=5.0)
@@ -233,7 +267,8 @@ def extract_final_comment(result: "AgentResult") -> str:
     stdout = re.sub(r"(?m)^> ", "", stdout)
 
     valid_tags = ("[Reproduced]", "[Not reproduced]", "[Partial reproduction]",
-                  "[RCA]", "[Error]", "[Needs info]")
+                  "[RCA]", "[Revised RCA]", "[Note]",
+                  "[Error]", "[Needs info]", "[Out of scope]")
     best_pos = -1
     for tag in valid_tags:
         idx = -1

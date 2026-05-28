@@ -6,22 +6,43 @@ repo checkout is on a clean state at the right ref. For now we just do:
   - git checkout upstream/main (detached HEAD)
   - git clean -fdx to remove leftover .bot-run.log etc.
 
-If the issue body mentions a version branch, the agent itself can switch to
-it (per /rca and /reproduce SOPs). We only get the workdir into a clean
-known state as a baseline.
+For /fix specifically, the bridge also ensures a `target` remote is configured
+pointing at the repo where the issue lives — that's where the PR will be
+opened. See `ensure_target_remote()`.
 """
 
 from __future__ import annotations
 
 import logging
 import subprocess
+import os
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 class WorkdirError(Exception):
     pass
+
+
+def _run(workdir: Path, cmd: list[str], check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess:
+    logger.debug("workdir %s$ %s", workdir, " ".join(cmd))
+    # Inherit the environment, but ensure git never blocks on an interactive
+    # credential prompt (would hang on a headless dev desktop). The workdir
+    # should have credential.helper configured locally to supply the bot's PAT
+    # for github.com pushes; if that lookup fails for any reason, we want git
+    # to fail fast rather than wait for stdin.
+    env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    cp = subprocess.run(
+        cmd, cwd=workdir, capture_output=True, text=True, timeout=timeout, env=env,
+    )
+    if check and cp.returncode != 0:
+        raise WorkdirError(
+            f"command failed: {' '.join(cmd)}\nstdout: {cp.stdout}\nstderr: {cp.stderr}"
+        )
+    return cp
 
 
 def prepare(workdir: str, default_branch: str = "main", upstream_remote: str = "upstream") -> str:
@@ -33,29 +54,98 @@ def prepare(workdir: str, default_branch: str = "main", upstream_remote: str = "
     if not (wd / ".git").exists():
         raise WorkdirError(f"not a git checkout: {wd}")
 
-    def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-        logger.debug("workdir %s$ %s", wd, " ".join(cmd))
-        cp = subprocess.run(
-            cmd, cwd=wd, capture_output=True, text=True, timeout=120
-        )
-        if check and cp.returncode != 0:
-            raise WorkdirError(
-                f"command failed: {' '.join(cmd)}\nstdout: {cp.stdout}\nstderr: {cp.stderr}"
-            )
-        return cp
-
     # Fetch latest
-    run(["git", "fetch", upstream_remote, "--prune"])
+    _run(wd, ["git", "fetch", upstream_remote, "--prune"])
 
     # Reset to clean state — detached HEAD at upstream/<default_branch>.
-    run(["git", "checkout", f"{upstream_remote}/{default_branch}"])
+    _run(wd, ["git", "checkout", f"{upstream_remote}/{default_branch}"])
 
-    # Clean up any leftover files from a prior run (e.g., .bot-run.log).
-    # -d: also remove untracked directories. -x: include ignored files too.
-    # Be careful: we intentionally use -x here because the agent's scratch log
-    # is gitignored.
-    run(["git", "clean", "-fdx"])
+    # Clean up any leftover files from a prior run (e.g., .bot-run.log,
+    # .bot-response.md, .bot-pr-body.md). -d: also remove untracked
+    # directories. -x: include ignored files too.
+    _run(wd, ["git", "clean", "-fdx"])
 
     # Return the resolved sha for logging.
-    cp = run(["git", "rev-parse", "--short", "HEAD"])
+    cp = _run(wd, ["git", "rev-parse", "--short", "HEAD"])
+    return cp.stdout.strip()
+
+
+def ensure_target_remote(workdir: str, target_repo: str, remote_name: str = "target") -> None:
+    """Idempotently configure a `<remote_name>` remote pointing at `target_repo`.
+
+    Used for /fix: the bridge needs to know where the PR will be opened so the
+    agent can fetch the target's base branch and the bridge can resolve cross-
+    repo PR head/base. The remote is named `target` (not `upstream`) so it
+    doesn't collide with the existing `upstream` remote that /rca and
+    /reproduce expect.
+    """
+    wd = Path(workdir)
+    if not (wd / ".git").exists():
+        raise WorkdirError(f"not a git checkout: {wd}")
+    target_url = f"https://github.com/{target_repo}.git"
+
+    # Is the remote already configured?
+    cp = _run(wd, ["git", "remote", "get-url", remote_name], check=False)
+    if cp.returncode == 0:
+        existing_url = cp.stdout.strip()
+        if existing_url == target_url:
+            return  # already correct
+        # Different URL — replace it.
+        _run(wd, ["git", "remote", "set-url", remote_name, target_url])
+    else:
+        _run(wd, ["git", "remote", "add", remote_name, target_url])
+    # Belt-and-suspenders: disable pushes to this remote to prevent accidents.
+    _run(wd, ["git", "remote", "set-url", "--push", remote_name, "DISABLED"], check=False)
+
+
+def fetch_and_checkout(workdir: str, remote: str, branch: str) -> str:
+    """Fetch `<remote>` and check out `<remote>/<branch>` detached. Returns short sha."""
+    wd = Path(workdir)
+    _run(wd, ["git", "fetch", remote, "--prune"])
+    _run(wd, ["git", "checkout", f"{remote}/{branch}"])
+    cp = _run(wd, ["git", "rev-parse", "--short", "HEAD"])
+    return cp.stdout.strip()
+
+
+def has_unpushed_commits(workdir: str, base_ref: str) -> bool:
+    """Return True if HEAD has commits ahead of `base_ref`. Used to verify the
+    agent actually committed before the bridge attempts to push.
+    """
+    wd = Path(workdir)
+    cp = _run(wd, ["git", "rev-list", "--count", f"{base_ref}..HEAD"], check=False)
+    if cp.returncode != 0:
+        # If the rev-list fails (e.g., base_ref unresolvable), conservatively
+        # say "no commits to push" rather than push something half-broken.
+        return False
+    try:
+        return int(cp.stdout.strip()) > 0
+    except ValueError:
+        return False
+
+
+def push_branch(workdir: str, remote: str, branch_name: str, force: bool = False) -> None:
+    """Push HEAD to `<remote>/<branch_name>`. If `force=False` (default) and
+    the remote branch already exists, the push will be rejected — the bridge
+    must handle that as an error and tell the maintainer.
+    """
+    wd = Path(workdir)
+    args = ["git", "push", remote, f"HEAD:refs/heads/{branch_name}"]
+    if force:
+        args.insert(2, "--force-with-lease")
+    _run(wd, args, timeout=180)
+
+
+def remote_branch_exists(workdir: str, remote: str, branch_name: str) -> bool:
+    """Check whether `<remote>/<branch_name>` already exists by ls-remote."""
+    wd = Path(workdir)
+    cp = _run(wd, ["git", "ls-remote", "--heads", remote, branch_name], check=False)
+    if cp.returncode != 0:
+        return False
+    return bool(cp.stdout.strip())
+
+
+def latest_commit_subject(workdir: str) -> str:
+    """Return the subject (first line) of the latest commit on HEAD."""
+    wd = Path(workdir)
+    cp = _run(wd, ["git", "log", "-1", "--pretty=%s"])
     return cp.stdout.strip()

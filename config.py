@@ -39,6 +39,7 @@ class Config:
     commands: Dict[str, str]
     poll_interval_seconds: int
     agent_timeout_seconds: int
+    fix_agent_timeout_seconds: int
     acknowledgment_mode: str
     max_comment_length: int
     dry_run: bool
@@ -182,6 +183,11 @@ def load_config(
         commands=dict(cfg["commands"]),
         poll_interval_seconds=int(cfg["poll_interval_seconds"]),
         agent_timeout_seconds=int(cfg["agent_timeout_seconds"]),
+        # Per-command override for /fix; defaults to 4x the standard timeout
+        # because /fix typically runs build + tests in addition to investigation.
+        fix_agent_timeout_seconds=int(
+            cfg.get("fix_agent_timeout_seconds", int(cfg["agent_timeout_seconds"]) * 4)
+        ),
         acknowledgment_mode=cfg["acknowledgment_mode"],
         max_comment_length=int(cfg["max_comment_length"]),
         dry_run=bool(cfg["dry_run"]),
