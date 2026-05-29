@@ -13,7 +13,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import yaml
 
@@ -44,6 +44,20 @@ class Config:
     max_comment_length: int
     dry_run: bool
 
+    # Git commit identity (used as workdir-local user.name/user.email so bot
+    # commits are attributed to the bot, not whoever owns the host's global
+    # ~/.gitconfig). Defaults derive from github_bot_username if unset.
+    git_author_name: Optional[str] = None
+    git_author_email: Optional[str] = None
+
+    # Path to the agent's installed github-comment-format SKILL.md. The
+    # bridge reads this at startup and extracts the venue-keyed format blocks
+    # delimited by `<!-- bridge-rule:start venue=... -->` markers, which it
+    # embeds into the agent's prompt at runtime. The skill file is the
+    # single source of truth for response format; the bridge does not
+    # duplicate the rules. Default targets the local AIM install path.
+    agent_skill_format_path: Optional[str] = None
+
     # Derived
     allowlist_lower: List[str] = field(default_factory=list)
     bot_username_lower: str = ""
@@ -51,6 +65,23 @@ class Config:
     def __post_init__(self) -> None:
         self.allowlist_lower = [u.lower() for u in self.allowlist]
         self.bot_username_lower = self.github_bot_username.lower()
+        if not self.git_author_name:
+            self.git_author_name = self.github_bot_username
+        if not self.git_author_email:
+            # Old-style noreply email. If a maintainer wants the user-id-prefixed
+            # form (e.g. 278766827+ryan-gh-bot@users.noreply.github.com), they
+            # can set git_author_email explicitly in config.yaml.
+            self.git_author_email = (
+                f"{self.github_bot_username}@users.noreply.github.com"
+            )
+        if not self.agent_skill_format_path:
+            # Default to the local AIM install path. Maintainers can override
+            # in config.yaml if their agent install is elsewhere.
+            self.agent_skill_format_path = str(
+                Path.home()
+                / ".aim/packages/local/OpenSearchMaintainerAgent-1.0"
+                / "skills/github-comment-format/SKILL.md"
+            )
 
     def tenant_for(self, repo: str) -> str | None:
         return self.repo_tenant_map.get(repo)
@@ -190,5 +221,11 @@ def load_config(
         ),
         acknowledgment_mode=cfg["acknowledgment_mode"],
         max_comment_length=int(cfg["max_comment_length"]),
+        # Optional git identity overrides; defaults derive from
+        # github_bot_username via Config.__post_init__.
+        git_author_name=cfg.get("git_author_name"),
+        git_author_email=cfg.get("git_author_email"),
+        # Optional override for where to read the format SKILL.md.
+        agent_skill_format_path=cfg.get("agent_skill_format_path"),
         dry_run=bool(cfg["dry_run"]),
     )

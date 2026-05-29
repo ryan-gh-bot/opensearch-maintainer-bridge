@@ -171,6 +171,25 @@ def has_unpushed_commits(workdir: str, base_ref: str) -> bool:
         return False
 
 
+def set_commit_identity(workdir: str, name: str, email: str) -> None:
+    """Set workdir-local user.name and user.email so commits made in this
+    workdir are attributed to the bot, not whoever owns the host's global
+    ~/.gitconfig.
+
+    Set on every workdir prep (fresh fix and revision). Cheap, idempotent;
+    git just rewrites the local config keys. Without this, a commit made
+    by the agent gets the host's global identity, which:
+      - Mis-attributes the commit (the bot is the entity making the change).
+      - Mixes authorship within a single PR (original commit by bot, revision
+        commits by host owner) which looks suspicious to maintainers.
+      - Breaks `git commit -s` DCO sign-offs because the trailer matches the
+        author identity, not the bot's.
+    """
+    wd = Path(workdir)
+    _run(wd, ["git", "config", "--local", "user.name", name])
+    _run(wd, ["git", "config", "--local", "user.email", email])
+
+
 def is_ancestor(workdir: str, ancestor_ref: str, descendant_ref: str = "HEAD") -> bool:
     """Return True if `ancestor_ref` is an ancestor of `descendant_ref` —
     i.e., descendant_ref is reachable from ancestor_ref via parent links.
@@ -216,4 +235,12 @@ def latest_commit_subject(workdir: str) -> str:
     """Return the subject (first line) of the latest commit on HEAD."""
     wd = Path(workdir)
     cp = _run(wd, ["git", "log", "-1", "--pretty=%s"])
+    return cp.stdout.strip()
+
+
+def latest_commit_sha(workdir: str, short: bool = True) -> str:
+    """Return the SHA of HEAD. Short by default (7-char), full if short=False."""
+    wd = Path(workdir)
+    fmt = "%h" if short else "%H"
+    cp = _run(wd, ["git", "log", "-1", f"--pretty={fmt}"])
     return cp.stdout.strip()

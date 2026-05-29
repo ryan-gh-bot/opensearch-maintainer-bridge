@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from textwrap import dedent
 
 from agent_runner import AgentRunError, extract_final_comment, run_agent, truncate_comment
@@ -34,11 +35,13 @@ from workdir_manager import (
     fetch_and_checkout,
     has_unpushed_commits,
     is_ancestor,
+    latest_commit_sha,
     latest_commit_subject,
     prepare as prepare_workdir,
     prepare_for_revision,
     push_branch,
     remote_branch_exists,
+    set_commit_identity,
 )
 
 LOG_FILE = Path.home() / ".local" / "state" / "opensearch-maintainer-bot" / "bridge.log"
@@ -571,6 +574,76 @@ FIX_RESPONSE_FILE = ".bot-response.md"   # status comment for the issue
 FIX_PR_BODY_FILE  = ".bot-pr-body.md"    # PR body the bridge will use
 
 
+# ---------------------------------------------------------------------
+# Format-rule loader
+# ---------------------------------------------------------------------
+#
+# The agent's `skills/github-comment-format/SKILL.md` is the single source of
+# truth for response-format rules. The bridge reads it at startup, extracts
+# the venue-keyed blocks delimited by `<!-- bridge-rule:start venue=X -->` and
+# `<!-- bridge-rule:end -->`, and embeds the right block into each agent
+# prompt. Because the bridge consumes the same file the agent does, the two
+# cannot drift — there's exactly one place to edit format rules.
+#
+# Cached at process startup. Restarting the bridge picks up SKILL.md changes.
+
+# Compiled once. Captures `venue=<name>` then everything until the matching
+# `<!-- bridge-rule:end -->`. DOTALL so `.` matches newlines.
+_BRIDGE_RULE_RE = re.compile(
+    r"<!--\s*bridge-rule:start\s+venue=([^\s>]+)\s*-->\s*\n"
+    r"(.*?)"
+    r"\n\s*<!--\s*bridge-rule:end\s*-->",
+    flags=re.DOTALL,
+)
+
+# Populated by load_format_rules() at startup. Maps venue name -> rule block.
+_FORMAT_RULES: dict[str, str] = {}
+
+
+def load_format_rules(skill_path: str) -> dict[str, str]:
+    """Read the agent's format SKILL.md, extract bridge-rule blocks, return
+    {venue: rule_text}. Empty dict if the file is missing or has no markers.
+
+    Called once at bridge startup. The result is cached in _FORMAT_RULES and
+    consumed by build_fix_prompt at agent-invocation time.
+    """
+    p = Path(skill_path)
+    if not p.exists():
+        logger.warning(
+            "format SKILL.md not found at %s — falling back to empty rules. "
+            "Agent prompts will not include venue-specific format guidance.",
+            skill_path,
+        )
+        return {}
+    text = p.read_text(encoding="utf-8")
+    rules = {}
+    for m in _BRIDGE_RULE_RE.finditer(text):
+        venue = m.group(1).strip()
+        body = m.group(2).strip()
+        rules[venue] = body
+    if not rules:
+        logger.warning(
+            "format SKILL.md at %s has no `<!-- bridge-rule:start venue=... -->`"
+            " sections — falling back to empty rules.",
+            skill_path,
+        )
+    else:
+        logger.info(
+            "loaded %d format-rule block(s) from %s: venues=%s",
+            len(rules), skill_path, sorted(rules.keys()),
+        )
+    return rules
+
+
+def get_format_rule(venue: str) -> str:
+    """Return the rule block for a venue, or an empty string if missing.
+
+    `venue` is one of the names declared in SKILL.md (today: `review-comment`,
+    `top-level`). Callers that want a fallback should default to "top-level".
+    """
+    return _FORMAT_RULES.get(venue, "")
+
+
 def handle_fix_comment(
     cfg: Config,
     gh: GitHubClient,
@@ -657,6 +730,12 @@ def handle_fix_comment(
         branch_name = rs.bot_authored_prs[comment.issue_number].branch
         try:
             sha = prepare_for_revision(workdir, branch_name)
+            # Always (re)set the bot's commit identity in the workdir so any
+            # commit the agent makes is attributed to the bot, regardless of
+            # what the host's global ~/.gitconfig has.
+            set_commit_identity(
+                workdir, cfg.git_author_name, cfg.git_author_email
+            )
         except WorkdirError as e:
             _post_error(cfg, gh, state, repo, comment,
                         f"Failed to prepare workdir for PR revision:\n\n```\n{e}\n```")
@@ -669,6 +748,9 @@ def handle_fix_comment(
         try:
             prepare_workdir(workdir)  # fetches upstream, cleans
             sha = fetch_and_checkout(workdir, "target", base_branch)
+            set_commit_identity(
+                workdir, cfg.git_author_name, cfg.git_author_email
+            )
         except WorkdirError as e:
             _post_error(cfg, gh, state, repo, comment,
                         f"Failed to prepare workdir for /fix:\n\n```\n{e}\n```")
@@ -730,6 +812,7 @@ def handle_fix_comment(
         request_text=parsed.request_text if is_triage else "",
         is_pull_request=is_pull_request,
         conversation=conversation,
+        is_review_comment_dispatch=(comment.review_comment_id is not None),
     )
 
     logger.info("%s invoking agent (timeout=%ds, prompt=%d chars)",
@@ -758,8 +841,13 @@ def handle_fix_comment(
     pr_body_path = Path(workdir) / FIX_PR_BODY_FILE
     response_body = (result.response_body or "").strip()
 
-    if not pr_body_path.exists():
-        # No PR body → agent decided not to fix. Post the status comment.
+    # `.bot-pr-body.md` is required when CREATING a new PR (fresh fix path).
+    # In revision mode the existing PR keeps its body — the agent shouldn't
+    # need to rewrite it. So in revision mode we determine "agent produced a
+    # fix" from has_unpushed_commits alone, not from .bot-pr-body.md presence.
+    if not is_revision and not pr_body_path.exists():
+        # Fresh-fix path with no PR body → agent decided not to fix.
+        # Post the status comment and stop.
         if not response_body:
             _post_error(cfg, gh, state, repo, comment,
                         "Agent finished without writing a PR body or a status comment.")
@@ -829,12 +917,13 @@ def handle_fix_comment(
             pass
         logger.info("/fix [revision] updated PR #%d: %s", comment.issue_number, pr_url)
 
-        commit_subject = latest_commit_subject(workdir)
-        follow_up = (
-            f"Pushed updates to {pr_url} (latest commit: `{commit_subject}`).\n\n"
-            f"This update was generated by `@{cfg.github_bot_username}` in response "
-            f"to feedback from @{comment.user}. Please review the new commits."
-        )
+        # Tight conversational confirmation matching the in-thread reply tone.
+        # Just the linked SHA — the maintainer just asked for the change and
+        # can click through if they want detail. Don't repeat the commit
+        # subject; that's noise in a thread.
+        commit_sha = latest_commit_sha(workdir, short=True)
+        commit_url = f"https://github.com/{repo}/pull/{comment.issue_number}/commits/{commit_sha}"
+        follow_up = f"Done — pushed [`{commit_sha}`]({commit_url})."
         _post_response_to_comment(cfg, gh, state, repo, comment, follow_up)
         return
 
@@ -906,6 +995,7 @@ def build_fix_prompt(
     request_text: str = "",
     is_pull_request: bool = False,
     conversation: str = "",
+    is_review_comment_dispatch: bool = False,
 ) -> str:
     """Construct the prompt the kiro-cli agent receives on stdin.
 
@@ -942,6 +1032,35 @@ def build_fix_prompt(
             REQUEST>>>
             """
         )
+
+    # Venue-aware response-format block. The actual rule TEXT lives in the
+    # agent's `skills/github-comment-format/SKILL.md` (delimited by
+    # `<!-- bridge-rule:start venue=... -->` markers). The bridge loaded those
+    # at startup into _FORMAT_RULES; we just look up the right one here.
+    # This way SKILL.md is the single source of truth for format.
+    venue_key = "review-comment" if is_review_comment_dispatch else "top-level"
+    rule_body = get_format_rule(venue_key)
+    if not rule_body:
+        # Defensive fallback — empty rules mean SKILL.md is missing or
+        # malformed. Don't crash the dispatch; log and proceed without
+        # a format block.
+        rule_body = (
+            "(no format rules loaded — see bridge log for SKILL.md issues)"
+        )
+    if is_review_comment_dispatch:
+        venue_intro = (
+            f"FORMAT for {FIX_RESPONSE_FILE} (this dispatch is an inline reply\n"
+            "in a PR review-comment thread — the bridge will post your output\n"
+            "as a threaded reply directly under the maintainer's comment in\n"
+            "the Files-changed tab):"
+        )
+    else:
+        venue_intro = (
+            f"FORMAT for {FIX_RESPONSE_FILE} (top-level comment on the\n"
+            "issue/PR conversation tab):"
+        )
+    response_format_block = f"{venue_intro}\n\n{rule_body}\n"
+
     return dedent(
         f"""\
         You are being invoked by the github-bridge in the {sop_name} flow.
@@ -993,20 +1112,46 @@ def build_fix_prompt(
         3. If no fix is being written (rca, reproduce, triage-clarify, or
            triage-decline):
            - Do NOT write {FIX_PR_BODY_FILE}.
-           - Write the comment body to {FIX_RESPONSE_FILE} starting with
-             `## [<Tag>] <summary>`.
-
+           - Write the comment body to {FIX_RESPONSE_FILE}.
+        {response_format_block}
         4. Brief chat output is fine. The chat is NOT what gets posted to
            GitHub; only the files above are.
-
-        Reminder of comment formatting requirements (apply to {FIX_RESPONSE_FILE}):
-        - First line: `## [<Tag>] <one-line summary>` — a level-2 header.
-        - Section headers use `### Name`.
-        - File references use clickable markdown deep-links to the exact sha.
-        - Footer is the standard italic one-liner.
-        - No emoji.
         """
     )
+
+
+def _strip_for_thread_reply(body: str) -> str:
+    """Strip the structured-comment chrome from a body that's about to be
+    posted as a review-comment-thread reply. Defensive: even if the agent's
+    SKILL.md says "don't use the [Tag] header in inline replies", the agent
+    sometimes regresses to it. Removing the chrome at the bridge boundary
+    means the user-visible reply is conversational regardless.
+
+    Strips:
+      - A leading `## [<Tag>] <title>` header line, plus the blank line that
+        usually follows it.
+      - A trailing block of the form:
+            ---
+            _Automated response from @<bot> ... ._
+        i.e., the horizontal rule + italicized footer the agent appends to
+        top-level posts.
+    """
+    import re as _re
+
+    s = body.strip("\n")
+
+    # Leading status-tag header: `## [Tag] ...`. Allow optional trailing blank.
+    s = _re.sub(r"^##\s+\[[^\]\n]+\][^\n]*\n+", "", s, count=1)
+
+    # Trailing footer: optional newline(s), `---`, then a line starting with
+    # `_Automated response`, then end of body.
+    s = _re.sub(
+        r"\n+---\s*\n_Automated response[^\n]*\n*\Z",
+        "",
+        s,
+    )
+
+    return s.strip("\n")
 
 
 def _post_response_to_comment(
@@ -1049,6 +1194,11 @@ def _post_response_to_comment(
 
     rcid = triggering_comment.review_comment_id
     if rcid is not None:
+        # Defensive strip of the [Tag] header and _Automated response_ footer
+        # — the SKILL.md says don't use them inline, but the agent sometimes
+        # ignores it. Strip at the boundary so the user-visible reply is
+        # conversational regardless of what the agent generated.
+        body = _strip_for_thread_reply(body)
         try:
             reply = gh.create_review_comment_reply(
                 repo, triggering_comment.issue_number, rcid, body,
@@ -1307,6 +1457,18 @@ def _poll_pr_reviews_once(
     cursor_rcomment = ap.last_seen_review_comment_id or 0
     new_rcomments_max_id = cursor_rcomment
 
+    # Two-phase processing for review-comments:
+    #   Phase 1: collect all actionable review-comments (pass @<bot> mention,
+    #            allowlist, etc.) AND eyes-emoji each one immediately.
+    #   Phase 2: dispatch each in turn through handle_fix_comment.
+    #
+    # Without phase 1, when a maintainer submits a review with N inline
+    # comments the eyes appear one at a time as the agent finishes each
+    # dispatch — the maintainer sees "bot saw 1 of my N comments" while
+    # the bot is still working through the first one. The two-phase pattern
+    # acks all N immediately so the maintainer knows the bot has seen
+    # everything, then the responses arrive as the agent works.
+    actionable: list[tuple[dict, ParsedCommand]] = []
     for rc in rcomments:
         rcid = int(rc.get("id") or 0)
         if rcid <= cursor_rcomment:
@@ -1326,7 +1488,24 @@ def _poll_pr_reviews_once(
             logger.warning("skip review-comment %d on %s#%d: user %s not on allowlist",
                            rcid, repo, pr_number, author)
             continue
+        actionable.append((rc, parsed))
 
+    # Phase 1: ack all actionable review-comments upfront.
+    for rc, _parsed in actionable:
+        rcid = int(rc.get("id") or 0)
+        try:
+            gh.add_pr_review_comment_reaction(repo, rcid, "eyes")
+            logger.info("ack reaction (upfront) on review-comment %d", rcid)
+        except GitHubError:
+            logger.exception("failed to add upfront eyes reaction to review-comment %d", rcid)
+
+    # Phase 2: dispatch each through the agent. The eyes are already up,
+    # so handle_fix_comment's own _acknowledge call becomes a redundant
+    # idempotent no-op (GitHub's reactions API is idempotent).
+    for rc, parsed in actionable:
+        rcid = int(rc.get("id") or 0)
+        author = rc.get("user") or ""
+        body = rc.get("body") or ""
         synth = Comment(
             id=rcid,
             issue_number=pr_number,
@@ -1401,6 +1580,11 @@ def main() -> int:
         workdir = cfg.workdir_for(tenant or "")
         logger.info("  %s -> tenant=%s workdir=%s", repo, tenant, workdir)
     logger.info("allowlist (%d users): %s", len(cfg.allowlist), ", ".join(cfg.allowlist))
+
+    # Load format rules from SKILL.md once at startup; cached in _FORMAT_RULES.
+    # build_fix_prompt looks up the venue-keyed block at agent-invocation time.
+    global _FORMAT_RULES
+    _FORMAT_RULES = load_format_rules(cfg.agent_skill_format_path)
 
     state = load_state()
     gh = GitHubClient(token=cfg.github_bot_token)
