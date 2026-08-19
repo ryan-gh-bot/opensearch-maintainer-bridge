@@ -311,6 +311,8 @@ See `config.example.yaml` for the full schema. Key knobs:
 
 ## Running
 
+**Interactive / development:**
+
 ```bash
 # One poll cycle, then exit (useful for testing)
 python3 bridge.py --once
@@ -323,6 +325,10 @@ python3 bridge.py --debug
 ```
 
 Logs go to stderr and to `~/.local/state/opensearch-maintainer-bot/bridge.log`. State is persisted after every iteration so restarts don't replay processed comments.
+
+**Production (recommended): install as a systemd service.**
+
+Two ready-to-use unit files live in [`contrib/systemd/`](contrib/systemd/README.md) — one for user systemd (systemd ≥ 240, no sudo needed day-to-day) and one for system systemd (works on older distros like Amazon Linux 2, needs sudo). See `contrib/systemd/README.md` for install steps. Once installed, the bridge starts on host boot, auto-restarts on crash, and streams logs into journald (`journalctl -u opensearch-maintainer-bridge -f`).
 
 ## Troubleshooting
 

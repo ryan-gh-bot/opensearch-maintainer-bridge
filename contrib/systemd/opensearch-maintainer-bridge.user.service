@@ -1,0 +1,30 @@
+[Unit]
+Description=OpenSearch Maintainer Bridge (github-bridge daemon)
+Documentation=https://github.com/ryan-gh-bot/opensearch-maintainer-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Path assumes you cloned the bridge to ~/workplace/github-bridge and created
+# the venv at ~/workplace/github-bridge/.venv. Adjust WorkingDirectory and
+# ExecStart if your layout differs.
+Type=simple
+WorkingDirectory=%h/workplace/github-bridge
+ExecStart=%h/workplace/github-bridge/.venv/bin/python3 %h/workplace/github-bridge/bridge.py
+
+# Auto-restart on crash. Cap the retry loop so a broken config doesn't
+# hammer the CPU: at most 5 restarts in a 5-minute window, then it gives up
+# and you can debug via `systemctl --user status`.
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+# journald is the sole log sink. Tail with:
+#   journalctl --user -u opensearch-maintainer-bridge -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=opensearch-maintainer-bridge
+
+[Install]
+WantedBy=default.target

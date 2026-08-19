@@ -1,0 +1,39 @@
+[Unit]
+Description=OpenSearch Maintainer Bridge (github-bridge daemon)
+Documentation=https://github.com/ryan-gh-bot/opensearch-maintainer-bridge
+After=network-online.target
+Wants=network-online.target
+# StartLimit* moved from [Unit] to [Service] and got a Sec suffix in
+# systemd 230. Keeping them in [Unit] with the old name means this unit
+# works on any systemd from 219 (Amazon Linux 2) through current.
+StartLimitBurst=5
+StartLimitInterval=300s
+
+[Service]
+# Two things you MUST edit below before installing:
+#   - User=       — the local Unix user that owns the workdir, config, and creds.
+#   - The three PATHs (WorkingDirectory, ExecStart, Environment=HOME) — must
+#     match that user's home directory.
+# Assumes clone at ~<user>/workplace/github-bridge and venv at
+# ~<user>/workplace/github-bridge/.venv. Adjust if your layout differs.
+User=REPLACE_WITH_YOUR_USER
+Environment=HOME=/home/REPLACE_WITH_YOUR_USER
+WorkingDirectory=/home/REPLACE_WITH_YOUR_USER/workplace/github-bridge
+ExecStart=/home/REPLACE_WITH_YOUR_USER/workplace/github-bridge/.venv/bin/python3 /home/REPLACE_WITH_YOUR_USER/workplace/github-bridge/bridge.py
+
+Type=simple
+
+# Auto-restart on crash. The retry cap (5 restarts in 5 min) lives in [Unit]
+# above so it's compatible with older systemd. If it's hit, systemd stops
+# trying and you can debug via `sudo systemctl status opensearch-maintainer-bridge`.
+Restart=on-failure
+RestartSec=10
+
+# journald is the sole log sink. Tail with:
+#   sudo journalctl -u opensearch-maintainer-bridge -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=opensearch-maintainer-bridge
+
+[Install]
+WantedBy=multi-user.target
