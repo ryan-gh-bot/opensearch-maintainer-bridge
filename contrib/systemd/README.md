@@ -121,6 +121,41 @@ sudo rm /etc/systemd/system/opensearch-maintainer-bridge.service
 sudo systemctl daemon-reload
 ```
 
+## Troubleshooting
+
+**`[Error] Agent invocation failed: kiro-cli not found on PATH`** (posted as a
+comment on GitHub, or seen in the journal).
+
+systemd runs the service with a minimal `PATH`
+(`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin`) that does not include
+your interactive shell's additions. The agent CLI (`kiro-cli`, installed by
+Amazon's Toolbox under `~/.toolbox/bin`) isn't on that minimal PATH, so the
+bridge can't launch it.
+
+Both unit files here already set an `Environment=PATH=...` that prepends
+`~/.toolbox/bin` (plus `~/.local/bin` and `~/bin`). If you installed an older
+copy of the unit, or your agent CLI lives elsewhere, add a drop-in without
+touching the main unit:
+
+```bash
+# system variant:
+sudo mkdir -p /etc/systemd/system/opensearch-maintainer-bridge.service.d
+sudo tee /etc/systemd/system/opensearch-maintainer-bridge.service.d/path.conf >/dev/null <<EOF
+[Service]
+Environment=PATH=$HOME/.toolbox/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EOF
+sudo systemctl daemon-reload
+sudo systemctl restart opensearch-maintainer-bridge
+```
+
+Verify the running service's PATH:
+
+```bash
+sudo systemctl show opensearch-maintainer-bridge -p Environment
+```
+
+Find where your agent CLI actually is: `which kiro-cli` in an interactive shell.
+
 ## What the unit does NOT do
 
 - **Does not create the workdir / venv / config.** You still need to complete the End-to-end setup steps in the top-level README before installing the service.

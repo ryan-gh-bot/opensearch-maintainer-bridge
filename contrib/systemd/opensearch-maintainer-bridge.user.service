@@ -12,6 +12,14 @@ Type=simple
 WorkingDirectory=%h/workplace/github-bridge
 ExecStart=%h/workplace/github-bridge/.venv/bin/python3 %h/workplace/github-bridge/bridge.py
 
+# The bridge invokes the agent CLI (kiro-cli) as a subprocess and finds it via
+# PATH. systemd gives services a minimal PATH that does NOT include your
+# interactive shell's additions, so the agent CLI's directory must be listed
+# here explicitly or the bridge fails with "kiro-cli not found on PATH".
+# %h/.toolbox/bin is where Amazon's Toolbox installs kiro-cli; adjust if your
+# agent CLI lives elsewhere.
+Environment=PATH=%h/.toolbox/bin:%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 # Auto-restart on crash. Cap the retry loop so a broken config doesn't
 # hammer the CPU: at most 5 restarts in a 5-minute window, then it gives up
 # and you can debug via `systemctl --user status`.
